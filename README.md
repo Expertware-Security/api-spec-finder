@@ -1,17 +1,46 @@
-# API Auth Recon
+# Internal API Auth Recon
 
-A small scanner for checking which HTTP APIs on an internal network actually
-require authentication. You point it at a list of hosts, it finds the live web
-services, looks for Swagger/OpenAPI specs, pulls the GET endpoints out of those
-specs, and hits each one without any credentials to see whether it comes back
-open or asks for a token.
+Two scripts that together check which HTTP APIs on an internal network actually
+require authentication. The first one discovers hosts, the second one probes
+them. You can run them as a pipeline or use either on its own.
 
-It was built for authorized internal security assessments. Only send it at hosts
-you have written permission to test.
+  1. `recon_hosts.py` builds the target list. It has three modes so two people
+     can split the work: an `ldap` mode that pulls computers and HTTP service
+     principals out of Active Directory, a `subnet` mode that sweeps local
+     interface ranges and any CIDRs you give it, and a `merge` mode that combines
+     both operators' output into one `hosts.txt`.
 
-## What it does
+  2. `api_auth_recon.py` takes that host list, finds the live web services, looks
+     for Swagger/OpenAPI specs, pulls the GET endpoints out of those specs, and
+     hits each one without any credentials to see whether it comes back open or
+     asks for a token.
 
-For every host you feed it, the script runs through four steps:
+Both were built for authorized internal security assessments. Only run them
+against hosts and ranges you have written permission to test.
+
+Typical flow when two people share the job:
+
+```
+pip install -r requirements.txt
+
+# person A, Active Directory
+python recon_hosts.py ldap --user 'DOMAIN\\youruser' --password 'secret' -o recon_out
+
+# person B, network ranges (can reuse the AD subnet list A produced)
+python recon_hosts.py subnet --interfaces --cidr-file recon_out/ad_subnets.txt -o recon_out
+
+# combine both, then scan
+python recon_hosts.py merge -o recon_out
+python api_auth_recon.py -i recon_out/hosts.txt -o api_recon.jsonl
+```
+
+Working solo, just run both discovery modes yourself and merge. The rest of this
+file documents `api_auth_recon.py`. The discovery script is covered in its own
+section near the end.
+
+## What the scanner does
+
+For every host you feed it, the scanner runs through four steps:
 
 1. Probes a set of common HTTP and HTTPS ports and records the ones that answer.
 2. Tries the usual Swagger and OpenAPI paths on each live service.
@@ -128,3 +157,103 @@ Negotiate or NTLM value in the `www_authenticate` column, not as open.
 Keep the authorization paperwork handy for whatever ranges you put in the hosts
 file. The default User-Agent is set to flag the traffic as an authorized
 assessment so it is easy to spot in their logs.
+
+# Building the host list with recon_hosts.py
+
+This is the discovery stage, and it has three modes so two people can divide the
+work. Its dependencies live in the shared `requirements.txt`. Each mode writes
+its own files into the output directory so two operators on two machines never
+overwrite each other:
+
+- `ldap` writes `hosts_ldap.txt`, `inventory_ldap.csv`, and `ad_subnets.txt`
+- `subnet` writes `hosts_subnet.txt` and `inventory_subnet.csv`
+- `merge` writes the combined `hosts.txt`
+
+Point both operators at the same output directory (a share, or just copy the
+files together at the end) and `merge` will pick up every `hosts_*.txt` it finds.
+
+## The ldap mode
+
+This queries a domain controller, which any normal domain user can read. It pulls
+computer objects for their DNS names and operating system, and it reads the HTTP
+service principals, which point straight at web services and sometimes carry a
+port. Those port-carrying entries come out as `host:port` lines, which the
+scanner understands directly. It also reads the subnet list from AD Sites and
+writes it to `ad_subnets.txt`, which is the natural handoff to whoever is running
+the subnet mode.
+
+The reliable way to authenticate is an NTLM bind with an explicit credential:
+
+```
+python recon_hosts.py ldap --user 'DOMAIN\\youruser' --password 'secret' -o recon_out
+```
+
+You can also pass `--user user@domain.tld`. If you would rather use the Kerberos
+ticket you already have on a domain-joined box, use `--kerberos` instead of a
+password, though that needs a working GSSAPI or SSPI setup. If you leave off
+`--dc` and `--domain`, the script tries to work them out from the environment and
+from DNS SRV records, which usually just works on a domain-joined machine.
+
+ldap mode options: `--dc`, `--domain`, `--user`, `--password`, `--kerberos`,
+`--ssl` (LDAPS on 636), `--page-size` (default 500).
+
+## The subnet mode
+
+This finds hosts by reachability rather than by AD membership, so it catches
+appliances and Linux boxes that are not domain-joined. Give it any mix of local
+interfaces and explicit ranges. It works out each subnet, runs a quick TCP
+connect check on a handful of common ports, and keeps only the addresses that
+answer, so dead space does not clog the list.
+
+```
+# sweep the ranges your own NICs sit on
+python recon_hosts.py subnet --interfaces -o recon_out
+
+# sweep the AD subnet map the ldap operator produced
+python recon_hosts.py subnet --cidr-file recon_out/ad_subnets.txt -o recon_out
+
+# or a specific range or two
+python recon_hosts.py subnet --cidr 10.20.0.0/24 --cidr 10.20.1.0/24 -o recon_out
+```
+
+`--cidr-file` accepts a plain list of CIDRs and also the tab-separated
+`ad_subnets.txt` format, so the handoff is a straight copy. You can combine
+`--interfaces`, `--cidr`, and `--cidr-file` in one run.
+
+subnet mode options: `--interfaces`, `--cidr` (repeatable), `--cidr-file`,
+`--ports` (default 80, 443, 445, 3389, 22, 8080, 8443), `--timeout` (default
+1.0s), `--workers` (default 200), `--max-hosts` (skip any subnet bigger than this
+many hosts, default 4096), `--include-public` (also sweep non-private interface
+subnets, which you usually do not want).
+
+## The merge mode
+
+```
+python recon_hosts.py merge -o recon_out
+```
+
+With no file arguments it combines every `hosts_*.txt` in the output directory.
+You can also name files explicitly, which is handy if the two of you kept
+separate directories:
+
+```
+python recon_hosts.py merge personA/hosts_ldap.txt personB/hosts_subnet.txt -o recon_out
+```
+
+The result is a deduplicated `hosts.txt` ready for the scanner.
+
+## Notes
+
+The 445 and 3389 ports are in the default sweep list on purpose. They are good
+signals that a Windows host is alive even when it has no web service, which keeps
+the host list complete. The scanner re-probes real web ports itself later, so the
+sweep here is only about pruning dead addresses, not about finding web apps.
+
+Output is written and flushed as it goes and re-dumped if you press Ctrl-C, so an
+interrupted run still leaves you a usable host list. Large subnets are skipped by
+default rather than swept blindly, so check `ad_subnets.txt` afterwards if you
+want to reach into a range the sweep left out.
+
+As with the scanner, `ldap3` does not silently reuse your Windows login. You give
+it a credential or a Kerberos ticket explicitly, so it is clear what account the
+enumeration ran as.

@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+"""
+recon_hosts.py  -  Build a hosts file for an internal assessment.
+
+Three modes, so two people can split the work and merge at the end:
+
+  recon_hosts.py ldap   ...   Active Directory discovery over LDAP
+  recon_hosts.py subnet ...   local interfaces and/or explicit CIDRs, TCP sweep
+  recon_hosts.py merge  ...   combine several hosts_*.txt into one hosts.txt
+
+Each mode writes its own files so two operators on two machines never clobber
+each other:
+
+  ldap   -> hosts_ldap.txt,   inventory_ldap.csv,   ad_subnets.txt
+  subnet -> hosts_subnet.txt, inventory_subnet.csv
+  merge  -> hosts.txt
+
+Natural handoff: the ldap operator produces ad_subnets.txt, hands it to the
+subnet operator who feeds it with  subnet --cidr-file ad_subnets.txt.
+
+Files are written and flushed as work happens and re-dumped on Ctrl-C, so an
+interrupted run still leaves a usable list. Authorized assessments only.
+
+Auth (a normal domain user can read all of this):
+  - NTLM with an explicit credential is the reliable path:
+        ldap --user 'DOMAIN\\user' --password 'secret'
+    (or --user user@domain.tld)
+  - --kerberos uses your current ticket (needs a working GSSAPI/SSPI setup).
+  - DC and domain are auto-discovered from the environment / DNS when omitted.
+"""
+
+import argparse
+import atexit
+import csv
+import glob
+import ipaddress
+import os
+import re
+import signal
+import socket
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import psutil
+from rich.console import Console
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
+
+console = Console()
+
+DEFAULT_SWEEP_PORTS = [80, 443, 445, 3389, 22, 8080, 8443]
+MAX_SUBNET_HOSTS = 4096          # skip anything bigger than a /20 unless raised
+
+
+# ----------------------------------------------------------------------------- output store
+class Output:
+    """Discovered items + atomic dump of a per-mode hosts file and inventory."""
+
+    def __init__(self, outdir, tag):
+        self.outdir = outdir
+        self.tag = tag
+        os.makedirs(outdir, exist_ok=True)
+        self.hosts = {}          # line -> line, dedups
+        self.inventory = []
+        self.ad_subnets = []     # (cidr, site)
+        self._lock = threading.Lock()
+        self.hosts_path = os.path.join(outdir, f"hosts_{tag}.txt")
+        self.inv_path = os.path.join(outdir, f"inventory_{tag}.csv")
+        self.subnets_path = os.path.join(outdir, "ad_subnets.txt")
+
+    def add_host(self, host, port=None, source="", os_name="", spns=""):
+        host = host.strip().rstrip(".").lower()
+        if not host:
+            return
+        line = f"{host}:{port}" if port else host
+        with self._lock:
+            self.hosts[line] = line
+            self.inventory.append({"host": host, "port": port or "",
+                                   "source": source, "os": os_name, "http_spns": spns})
+
+    def add_subnet(self, cidr, site=""):
+        with self._lock:
+            self.ad_subnets.append((cidr, site))
+
+    def dump(self):
+        with self._lock:
+            hosts = sorted(self.hosts.values())
+            inv = list(self.inventory)
+            subs = list(self.ad_subnets)
+        _atomic_write(self.hosts_path, "\n".join(hosts) + ("\n" if hosts else ""))
+        with open(self.inv_path, "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=["host", "port", "source", "os", "http_spns"])
+            w.writeheader()
+            for row in inv:
+                w.writerow(row)
+        if subs:
+            _atomic_write(self.subnets_path,
+                          "".join(f"{c}\t{s}\n" for c, s in subs))
+
+
+def _atomic_write(path, text):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+# ----------------------------------------------------------------------------- environment discovery
+def discover_domain(explicit):
+    if explicit:
+        return explicit
+    for var in ("USERDNSDOMAIN", "USERDOMAIN"):
+        v = os.environ.get(var)
+        if v and "." in v:
+            return v.lower()
+    return None
+
+
+def discover_dc(explicit, domain):
+    if explicit:
+        return explicit
+    ls = os.environ.get("LOGONSERVER", "").strip("\\")
+    if ls:
+        return ls
+    if domain:
+        try:
+            import dns.resolver
+            ans = dns.resolver.resolve(f"_ldap._tcp.dc._msdcs.{domain}", "SRV")
+            recs = sorted(ans, key=lambda r: (r.priority, -r.weight))
+            if recs:
+                return str(recs[0].target).rstrip(".")
+        except Exception:
+            pass
+    return None
+
+
+# ----------------------------------------------------------------------------- LDAP
+def _first(v):
+    if isinstance(v, (list, tuple)):
+        return v[0] if v else None
+    return v
+
+
+def _http_spn_hosts(spns, domain):
+    """Parse HTTP/... SPNs into (host, port_or_None), FQDN-normalised, deduped."""
+    out = []
+    for spn in spns or []:
+        if not str(spn).upper().startswith("HTTP/"):
+            continue
+        rest = str(spn)[5:].split("/")[0]
+        host, _, port = rest.partition(":")
+        host = host.strip().rstrip(".").lower()
+        if not host:
+            continue
+        if "." not in host and domain:
+            host = f"{host}.{domain}"
+        out.append((host, int(port) if port.isdigit() else None))
+    seen, res = set(), []
+    for h, p in out:
+        if (h, p) not in seen:
+            seen.add((h, p))
+            res.append((h, p))
+    return res
+
+
+def ldap_recon(out, dc, domain, user, password, use_kerberos, use_ssl, page_size):
+    from ldap3 import Server, Connection, ALL, NTLM, SASL, KERBEROS, SUBTREE
+    from ldap3.core.exceptions import LDAPException
+
+    port = 636 if use_ssl else 389
+    console.print(f"[cyan][ldap][/cyan] connecting to {dc}:{port} "
+                  f"({'LDAPS' if use_ssl else 'LDAP'})")
+    try:
+        server = Server(dc, port=port, use_ssl=use_ssl, get_info=ALL)
+        if use_kerberos:
+            conn = Connection(server, authentication=SASL, sasl_mechanism=KERBEROS,
+                              auto_bind=True)
+        elif user and password:
+            conn = Connection(server, user=user, password=password,
+                              authentication=NTLM, auto_bind=True)
+        else:
+            console.print("[red][ldap][/red] no usable credentials "
+                          "(give --user/--password or --kerberos).")
+            return
+    except LDAPException as e:
+        console.print(f"[red][ldap][/red] bind failed: {e}")
+        return
+    except Exception as e:
+        console.print(f"[red][ldap][/red] connection error: {e}")
+        return
+
+    info = server.info
+    base_dn = info.other.get("defaultNamingContext", [None])[0] if info else None
+    conf_dn = info.other.get("configurationNamingContext", [None])[0] if info else None
+    if not base_dn:
+        console.print("[red][ldap][/red] could not read defaultNamingContext.")
+        conn.unbind()
+        return
+    console.print(f"[cyan][ldap][/cyan] base DN: {base_dn}")
+
+    comp_filter = ("(&(objectCategory=computer)(objectClass=computer)"
+                   "(!(userAccountControl:1.2.840.113556.1.4.803:=2)))")
+    n_comp = 0
+    try:
+        entries = conn.extend.standard.paged_search(
+            search_base=base_dn, search_filter=comp_filter, search_scope=SUBTREE,
+            attributes=["dNSHostName", "name", "operatingSystem", "servicePrincipalName"],
+            paged_size=page_size, generator=True)
+        for e in entries:
+            if e.get("type") != "searchResEntry":
+                continue
+            a = e["attributes"]
+            dns_name = _first(a.get("dNSHostName"))
+            name = _first(a.get("name"))
+            os_name = _first(a.get("operatingSystem")) or ""
+            http_hosts = _http_spn_hosts(a.get("servicePrincipalName") or [], domain)
+            spn_str = ";".join(f"{h}:{p}" if p else h for h, p in http_hosts)
+            host = dns_name or (f"{name}.{domain}" if (name and domain) else name)
+            if host:
+                out.add_host(host, source="ldap-computer", os_name=os_name, spns=spn_str)
+                n_comp += 1
+            for h, p in http_hosts:
+                out.add_host(h, port=p, source="ldap-http-spn", os_name=os_name)
+        console.print(f"[green][ldap][/green] {n_comp} computers, HTTP SPNs folded in.")
+        out.dump()
+    except Exception as e:
+        console.print(f"[red][ldap][/red] computer search error: {e}")
+
+    if conf_dn:
+        sub_base = f"CN=Subnets,CN=Sites,{conf_dn}"
+        try:
+            conn.search(search_base=sub_base, search_filter="(objectClass=subnet)",
+                        search_scope=SUBTREE, attributes=["cn", "siteObject"])
+            for e in conn.entries:
+                cidr = str(e.cn.value) if "cn" in e else ""
+                site = ""
+                if "siteObject" in e and e.siteObject.value:
+                    m = re.search(r"CN=([^,]+)", str(e.siteObject.value))
+                    site = m.group(1) if m else ""
+                if cidr:
+                    out.add_subnet(cidr, site)
+            console.print(f"[green][ldap][/green] {len(out.ad_subnets)} AD subnets "
+                          f"-> {out.subnets_path}")
+            out.dump()
+            if out.ad_subnets:
+                console.print(f"[dim]Hand off to your teammate:  "
+                              f"python recon_hosts.py subnet --cidr-file "
+                              f"{out.subnets_path}[/dim]")
+        except Exception as e:
+            console.print(f"[yellow][ldap][/yellow] subnet search skipped: {e}")
+
+    conn.unbind()
+
+
+# ----------------------------------------------------------------------------- subnets / sweep
+def local_subnets(include_public=False):
+    nets = {}
+    for ifname, addrs in psutil.net_if_addrs().items():
+        for a in addrs:
+            if a.family != socket.AF_INET:
+                continue
+            ip, mask = a.address, a.netmask
+            if not ip or not mask or ip.startswith("127.") or ip.startswith("169.254."):
+                continue
+            try:
+                net = ipaddress.ip_network(f"{ip}/{mask}", strict=False)
+            except ValueError:
+                continue
+            if not include_public and not net.is_private:
+                continue
+            nets[str(net)] = (net, f"{ifname} {ip}")
+    return list(nets.values())
+
+
+def parse_cidr_lines(text):
+    """Accept plain CIDR lines and 'CIDR<tab>site' lines (ad_subnets.txt)."""
+    nets = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        tok = re.split(r"[\s,]+", line)[0]
+        try:
+            nets.append((ipaddress.ip_network(tok, strict=False), "cidr"))
+        except ValueError:
+            console.print(f"[yellow][subnet][/yellow] skipping bad CIDR: {tok}")
+    return nets
+
+
+def tcp_alive(host, ports, timeout):
+    for p in ports:
+        try:
+            with socket.create_connection((host, p), timeout=timeout):
+                return p
+        except Exception:
+            continue
+    return None
+
+
+def sweep(out, subnets, ports, timeout, workers, max_hosts):
+    targets = []
+    for net, label in subnets:
+        n = net.num_addresses - 2 if net.prefixlen < 31 else net.num_addresses
+        if n > max_hosts:
+            console.print(f"[yellow][subnet][/yellow] {net} ({label}) ~{n} hosts, "
+                          f"skipping (raise --max-hosts to include)")
+            continue
+        console.print(f"[cyan][subnet][/cyan] sweeping {net} ({label})")
+        for ip in net.hosts():
+            targets.append(str(ip))
+    if not targets:
+        console.print("[yellow][subnet][/yellow] nothing to sweep.")
+        return
+    progress = Progress(TextColumn("[progress.description]{task.description}"),
+                        BarColumn(), MofNCompleteColumn(), TimeElapsedColumn(),
+                        console=console)
+    alive = 0
+    with progress:
+        task = progress.add_task("[cyan]sweep", total=len(targets))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(tcp_alive, ip, ports, timeout): ip for ip in targets}
+            for fut in as_completed(futs):
+                ip = futs[fut]
+                try:
+                    p = fut.result()
+                except Exception:
+                    p = None
+                if p:
+                    alive += 1
+                    out.add_host(ip, source="subnet-sweep")
+                    console.print(f"  [green][alive][/green] {ip} (tcp/{p})")
+                    if alive % 20 == 0:
+                        out.dump()
+                progress.advance(task)
+    console.print(f"[green][subnet][/green] {alive} live hosts")
+    out.dump()
+
+
+# ----------------------------------------------------------------------------- mode runners
+def run_ldap(args):
+    out = Output(args.outdir, "ldap")
+    _install_finalizer(out, "ldap")
+    domain = discover_domain(args.domain)
+    dc = discover_dc(args.dc, domain)
+    if not dc:
+        console.print("[red][ldap][/red] no DC found (pass --dc).")
+        return
+    if domain:
+        console.print(f"[cyan][ldap][/cyan] domain: {domain}")
+    try:
+        ldap_recon(out, dc, domain, args.user, args.password,
+                   args.kerberos, args.ssl, args.page_size)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Ctrl-C -- saving what we have...[/yellow]")
+    out.dump()
+    console.print(f"\n[bold]LDAP done.[/bold] {len(out.hosts)} targets -> {out.hosts_path}")
+
+
+def run_subnet(args):
+    out = Output(args.outdir, "subnet")
+    _install_finalizer(out, "subnet")
+    ports = ([int(p) for p in args.ports.split(",")] if args.ports else DEFAULT_SWEEP_PORTS)
+    subnets = []
+    if args.interfaces:
+        subnets += local_subnets(include_public=args.include_public)
+        if not subnets:
+            console.print("[yellow][subnet][/yellow] no private IPv4 interface subnets.")
+    for c in args.cidr or []:
+        try:
+            subnets.append((ipaddress.ip_network(c, strict=False), "cidr"))
+        except ValueError:
+            console.print(f"[yellow][subnet][/yellow] bad --cidr: {c}")
+    if args.cidr_file:
+        try:
+            subnets += parse_cidr_lines(open(args.cidr_file, encoding="utf-8").read())
+        except OSError as e:
+            console.print(f"[red][subnet][/red] cannot read {args.cidr_file}: {e}")
+    if not (args.interfaces or args.cidr or args.cidr_file):
+        console.print("[red][subnet][/red] give --interfaces and/or --cidr/--cidr-file.")
+        return
+    try:
+        sweep(out, subnets, ports, args.timeout, args.workers, args.max_hosts)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Ctrl-C -- saving what we have...[/yellow]")
+    out.dump()
+    console.print(f"\n[bold]Subnet done.[/bold] {len(out.hosts)} targets -> {out.hosts_path}")
+
+
+def run_merge(args):
+    files = args.files or sorted(glob.glob(os.path.join(args.outdir, "hosts_*.txt")))
+    if not files:
+        console.print("[red][merge][/red] no input hosts files "
+                      "(pass files or run modes first).")
+        return
+    combined = {}
+    for f in files:
+        try:
+            for line in open(f, encoding="utf-8"):
+                line = line.strip().lower()
+                if line and not line.startswith("#"):
+                    combined[line] = line
+        except OSError as e:
+            console.print(f"[yellow][merge][/yellow] skip {f}: {e}")
+    os.makedirs(args.outdir, exist_ok=True)
+    master = os.path.join(args.outdir, "hosts.txt")
+    _atomic_write(master, "\n".join(sorted(combined.values())) + "\n")
+    console.print(f"[green][merge][/green] {len(files)} files -> {len(combined)} "
+                  f"unique targets -> {master}")
+    console.print(f"[dim]Next:  python api_auth_recon.py -i {master} -o api_recon.jsonl[/dim]")
+
+
+def _install_finalizer(out, mode):
+    done = threading.Event()
+
+    def finalize(*_):
+        if done.is_set():
+            return
+        done.set()
+        out.dump()
+        console.print(f"[green]{mode} files written to {out.outdir}/[/green]")
+
+    atexit.register(finalize)
+    try:
+        signal.signal(signal.SIGTERM, lambda *a: (finalize(), sys.exit(0)))
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------------------- CLI
+def main():
+    ap = argparse.ArgumentParser(description="Discovery for an internal assessment.")
+    ap.add_argument("-o", "--outdir", default="recon_out", help="output directory")
+    sub = ap.add_subparsers(dest="mode", required=True)
+
+    p_ldap = sub.add_parser("ldap", help="Active Directory discovery over LDAP")
+    p_ldap.add_argument("-o", "--outdir", default=argparse.SUPPRESS)
+    p_ldap.add_argument("--dc", help="domain controller host/IP (auto if omitted)")
+    p_ldap.add_argument("--domain", help="AD domain FQDN (auto if omitted)")
+    p_ldap.add_argument("--user", help="DOMAIN\\user or user@domain.tld")
+    p_ldap.add_argument("--password", help="password for --user (NTLM bind)")
+    p_ldap.add_argument("--kerberos", action="store_true", help="use current ticket")
+    p_ldap.add_argument("--ssl", action="store_true", help="LDAPS on 636")
+    p_ldap.add_argument("--page-size", type=int, default=500)
+    p_ldap.set_defaults(func=run_ldap)
+
+    p_sub = sub.add_parser("subnet", help="local interfaces and/or CIDRs + TCP sweep")
+    p_sub.add_argument("-o", "--outdir", default=argparse.SUPPRESS)
+    p_sub.add_argument("--interfaces", action="store_true",
+                       help="derive subnets from local NICs")
+    p_sub.add_argument("--cidr", action="append",
+                       help="explicit CIDR to sweep (repeatable)")
+    p_sub.add_argument("--cidr-file", help="file of CIDRs (accepts ad_subnets.txt)")
+    p_sub.add_argument("--ports", help="comma sweep ports "
+                       "(default 80,443,445,3389,22,8080,8443)")
+    p_sub.add_argument("--timeout", type=float, default=1.0, help="connect timeout s")
+    p_sub.add_argument("--workers", type=int, default=200, help="sweep concurrency")
+    p_sub.add_argument("--max-hosts", type=int, default=MAX_SUBNET_HOSTS,
+                       help=f"skip subnets bigger than this (default {MAX_SUBNET_HOSTS})")
+    p_sub.add_argument("--include-public", action="store_true",
+                       help="also sweep non-private interface subnets")
+    p_sub.set_defaults(func=run_subnet)
+
+    p_mrg = sub.add_parser("merge", help="combine hosts_*.txt into one hosts.txt")
+    p_mrg.add_argument("-o", "--outdir", default=argparse.SUPPRESS)
+    p_mrg.add_argument("files", nargs="*",
+                       help="hosts files to merge (default: hosts_*.txt in outdir)")
+    p_mrg.set_defaults(func=run_merge)
+
+    args = ap.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

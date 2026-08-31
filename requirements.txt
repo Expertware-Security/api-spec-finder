@@ -1,4 +1,12 @@
+# api_auth_recon.py (scanner)
 requests>=2.31
 urllib3>=2.0
 openpyxl>=3.1
+
+# recon_hosts.py (discovery)
+ldap3>=2.9
+psutil>=5.9
+dnspython>=2.4
+
+# shared
 rich>=13.7
