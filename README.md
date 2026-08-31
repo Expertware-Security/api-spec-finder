@@ -24,7 +24,7 @@ Typical flow when two people share the job:
 pip install -r requirements.txt
 
 # person A, Active Directory
-python recon_hosts.py ldap --user 'DOMAIN\\youruser' --password 'secret' -o recon_out
+python recon_hosts.py ldap --user 'CONTOSO\jdoe' --password 'secret' -o recon_out
 
 # person B, network ranges (can reuse the AD subnet list A produced)
 python recon_hosts.py subnet --interfaces --cidr-file recon_out/ad_subnets.txt -o recon_out
@@ -182,20 +182,37 @@ scanner understands directly. It also reads the subnet list from AD Sites and
 writes it to `ad_subnets.txt`, which is the natural handoff to whoever is running
 the subnet mode.
 
-The reliable way to authenticate is an NTLM bind with an explicit credential:
+The user format decides the bind method, and picking the wrong one is the usual
+cause of a bind failure. There are two forms:
+
+- `DOMAIN\user`, the NetBIOS domain and a backslash, does an NTLM bind. This is
+  the reliable default. In PowerShell quote it so the backslash survives:
+  `--user 'CONTOSO\jdoe'`.
+- `user@domain.tld`, a UPN, does a simple bind instead. A simple bind sends the
+  password in cleartext over plain LDAP, so add `--ssl` to run it over LDAPS.
 
 ```
-python recon_hosts.py ldap --user 'DOMAIN\\youruser' --password 'secret' -o recon_out
+python recon_hosts.py ldap --user 'CONTOSO\jdoe' --password 'secret' -o recon_out
 ```
 
-You can also pass `--user user@domain.tld`. If you would rather use the Kerberos
-ticket you already have on a domain-joined box, use `--kerberos` instead of a
-password, though that needs a working GSSAPI or SSPI setup. If you leave off
-`--dc` and `--domain`, the script tries to work them out from the environment and
-from DNS SRV records, which usually just works on a domain-joined machine.
+The script picks the method automatically from the user string. A bare username
+with neither a backslash nor an `@` cannot be used and it will tell you so up
+front rather than failing at the bind. You can override the choice with
+`--auth ntlm` or `--auth simple` if you need to.
 
-ldap mode options: `--dc`, `--domain`, `--user`, `--password`, `--kerberos`,
-`--ssl` (LDAPS on 636), `--page-size` (default 500).
+If you got `bind failed: NTLM needs domain/username and a password`, it means the
+user reached the NTLM path without a `DOMAIN\` prefix. Either add the domain and
+backslash, or use the UPN form with `--ssl`.
+
+If you would rather use the Kerberos ticket you already have on a domain-joined
+box, use `--kerberos` instead of a password, though that needs a working GSSAPI
+or SSPI setup. If you leave off `--dc` and `--domain`, the script tries to work
+them out from the environment and from DNS SRV records, which usually just works
+on a domain-joined machine.
+
+ldap mode options: `--dc`, `--domain`, `--user`, `--password`, `--auth`
+(auto, ntlm, simple), `--kerberos`, `--ssl` (LDAPS on 636), `--page-size`
+(default 500).
 
 ## The subnet mode
 

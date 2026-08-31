@@ -163,8 +163,24 @@ def _http_spn_hosts(spns, domain):
     return res
 
 
-def ldap_recon(out, dc, domain, user, password, use_kerberos, use_ssl, page_size):
-    from ldap3 import Server, Connection, ALL, NTLM, SASL, KERBEROS, SUBTREE
+def choose_auth(user, forced):
+    """Return 'ntlm' | 'simple' | None (with reason) for a given user string.
+
+    NTLM needs a NetBIOS-style 'DOMAIN\\user'. A UPN 'user@domain.tld' works with
+    a SIMPLE bind. A bare username with neither cannot be used.
+    """
+    if forced in ("ntlm", "simple"):
+        return forced, ""
+    if "\\" in user:
+        return "ntlm", ""
+    if "@" in user:
+        return "simple", ""
+    return None, ("user must be 'DOMAIN\\user' (for NTLM) or 'user@domain.tld' "
+                  "(for a simple bind). In PowerShell quote it: --user 'CONTOSO\\jdoe'.")
+
+
+def ldap_recon(out, dc, domain, user, password, use_kerberos, use_ssl, page_size, auth):
+    from ldap3 import Server, Connection, ALL, NTLM, SIMPLE, SASL, KERBEROS, SUBTREE
     from ldap3.core.exceptions import LDAPException
 
     port = 636 if use_ssl else 389
@@ -176,11 +192,20 @@ def ldap_recon(out, dc, domain, user, password, use_kerberos, use_ssl, page_size
             conn = Connection(server, authentication=SASL, sasl_mechanism=KERBEROS,
                               auto_bind=True)
         elif user and password:
+            method, reason = choose_auth(user, auth)
+            if method is None:
+                console.print(f"[red][ldap][/red] {reason}")
+                return
+            if method == "simple" and not use_ssl:
+                console.print("[yellow][ldap][/yellow] simple bind over plain LDAP "
+                              "sends the password in cleartext. Add --ssl for LDAPS.")
+            ldap_auth = NTLM if method == "ntlm" else SIMPLE
+            console.print(f"[cyan][ldap][/cyan] bind as {user} ({method})")
             conn = Connection(server, user=user, password=password,
-                              authentication=NTLM, auto_bind=True)
+                              authentication=ldap_auth, auto_bind=True)
         else:
             console.print("[red][ldap][/red] no usable credentials "
-                          "(give --user/--password or --kerberos).")
+                          "(give --user with --password, or --kerberos).")
             return
     except LDAPException as e:
         console.print(f"[red][ldap][/red] bind failed: {e}")
@@ -349,7 +374,7 @@ def run_ldap(args):
         console.print(f"[cyan][ldap][/cyan] domain: {domain}")
     try:
         ldap_recon(out, dc, domain, args.user, args.password,
-                   args.kerberos, args.ssl, args.page_size)
+                   args.kerberos, args.ssl, args.page_size, args.auth)
     except KeyboardInterrupt:
         console.print("\n[yellow]Ctrl-C -- saving what we have...[/yellow]")
     out.dump()
@@ -439,6 +464,9 @@ def main():
     p_ldap.add_argument("--user", help="DOMAIN\\user or user@domain.tld")
     p_ldap.add_argument("--password", help="password for --user (NTLM bind)")
     p_ldap.add_argument("--kerberos", action="store_true", help="use current ticket")
+    p_ldap.add_argument("--auth", choices=["auto", "ntlm", "simple"], default="auto",
+                        help="bind method: auto picks NTLM for DOMAIN\\user, "
+                             "simple for user@domain.tld (default auto)")
     p_ldap.add_argument("--ssl", action="store_true", help="LDAPS on 636")
     p_ldap.add_argument("--page-size", type=int, default=500)
     p_ldap.set_defaults(func=run_ldap)
