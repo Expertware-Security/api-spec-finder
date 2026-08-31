@@ -23,8 +23,8 @@ Typical flow when two people share the job:
 ```
 pip install -r requirements.txt
 
-# person A, Active Directory
-python recon_hosts.py ldap --user 'CONTOSO\jdoe' --password 'secret' -o recon_out
+# person A, Active Directory (binds as the current logged-in Windows user)
+python recon_hosts.py ldap -o recon_out
 
 # person B, network ranges (can reuse the AD subnet list A produced)
 python recon_hosts.py subnet --interfaces --cidr-file recon_out/ad_subnets.txt -o recon_out
@@ -182,12 +182,28 @@ scanner understands directly. It also reads the subnet list from AD Sites and
 writes it to `ad_subnets.txt`, which is the natural handoff to whoever is running
 the subnet mode.
 
-The user format decides the bind method, and picking the wrong one is the usual
-cause of a bind failure. There are two forms:
+By default the ldap mode binds as the **current logged-in Windows user** over
+SSPI / Kerberos. On a domain-joined machine that means there is nothing to type:
+no username, no password, no credential for the shell to mangle. Just run it.
 
-- `DOMAIN\user`, the NetBIOS domain and a backslash, does an NTLM bind. This is
-  the reliable default. In PowerShell quote it so the backslash survives:
-  `--user 'CONTOSO\jdoe'`.
+```
+python recon_hosts.py ldap -o recon_out
+```
+
+This uses the same integrated authentication a browser or WinHTTP would, taking
+the Kerberos ticket from your current logon session. It needs the `winkerberos`
+package (pulled in by `requirements.txt` on Windows) and a domain controller
+reachable by hostname — Kerberos builds its service ticket from the DC's name, so
+if you pass `--dc` give it a hostname or FQDN, not an IP. Leave `--dc` and
+`--domain` off and the script discovers them from your environment and DNS, which
+usually just works.
+
+If you need to run the enumeration as a **different account**, pass `--user` and
+the script switches to an explicit credential. The user format decides the bind
+method:
+
+- `DOMAIN\user`, the NetBIOS domain and a backslash, does an NTLM bind. In
+  PowerShell quote it so the backslash survives: `--user 'CONTOSO\jdoe'`.
 - `user@domain.tld`, a UPN, does a simple bind instead. A simple bind sends the
   password in cleartext over plain LDAP, so add `--ssl` to run it over LDAPS.
 
@@ -198,7 +214,9 @@ python recon_hosts.py ldap --user 'CONTOSO\jdoe' --password 'secret' -o recon_ou
 The script picks the method automatically from the user string. A bare username
 with neither a backslash nor an `@` cannot be used and it will tell you so up
 front rather than failing at the bind. You can override the choice with
-`--auth ntlm` or `--auth simple` if you need to.
+`--auth ntlm` or `--auth simple` if you need to. `--current-user` (an alias for
+`--kerberos`) forces the current-user path back on even when a `--user` is
+present.
 
 If you got `bind failed: NTLM needs domain/username and a password`, it means the
 user reached the NTLM path without a `DOMAIN\` prefix. Either add the domain and
@@ -238,15 +256,14 @@ script then reads `$LDAP_PASSWORD` if set, otherwise prompts for it without
 echoing. That is the most reliable way to pass a password with special
 characters.
 
-If you would rather use the Kerberos ticket you already have on a domain-joined
-box, use `--kerberos` instead of a password, though that needs a working GSSAPI
-or SSPI setup. If you leave off `--dc` and `--domain`, the script tries to work
-them out from the environment and from DNS SRV records, which usually just works
-on a domain-joined machine.
+All of that only applies when you deliberately run as another account with
+`--user`. If you just want to enumerate as yourself, drop `--user` entirely and
+let the default current-user bind do the work — there is no password to get
+wrong in the first place.
 
 ldap mode options: `--dc`, `--domain`, `--user`, `--password`, `--auth`
-(auto, ntlm, simple), `--kerberos`, `--ssl` (LDAPS on 636), `--gc`, `--page-size`
-(default 500).
+(auto, ntlm, simple), `--kerberos` / `--current-user`, `--ssl` (LDAPS on 636),
+`--gc`, `--page-size` (default 500).
 
 ### One domain or the whole forest
 
@@ -331,6 +348,9 @@ interrupted run still leaves you a usable host list. Large subnets are skipped b
 default rather than swept blindly, so check `ad_subnets.txt` afterwards if you
 want to reach into a range the sweep left out.
 
-As with the scanner, `ldap3` does not silently reuse your Windows login. You give
-it a credential or a Kerberos ticket explicitly, so it is clear what account the
-enumeration ran as.
+Note that the discovery and scanning stages authenticate differently, on
+purpose. The `ldap` mode binds as your current Windows login by default, because
+reading the directory as yourself is exactly what you want and a normal domain
+user can read all of it. The scanner, on the other hand, never reuses your login
+— it sends every request unauthenticated, so its results reflect genuine
+anonymous access rather than your own session.

@@ -22,10 +22,13 @@ Files are written and flushed as work happens and re-dumped on Ctrl-C, so an
 interrupted run still leaves a usable list. Authorized assessments only.
 
 Auth (a normal domain user can read all of this):
-  - NTLM with an explicit credential is the reliable path:
-        ldap --user 'DOMAIN\\user' --password 'secret'
-    (or --user user@domain.tld)
-  - --kerberos uses your current ticket (needs a working GSSAPI/SSPI setup).
+  - Default (no --user): bind as the CURRENT logged-in Windows user via SSPI /
+    Kerberos. No username or password to type or mangle -- just run:
+        ldap
+    On a domain-joined Windows box this is the reliable path and needs no creds.
+  - Explicit credential, if you must run as another account:
+        ldap --user 'DOMAIN\\user' --password 'secret'   (NTLM)
+        ldap --user user@domain.tld --ssl                 (simple bind over LDAPS)
   - DC and domain are auto-discovered from the environment / DNS when omitted.
 """
 
@@ -220,6 +223,36 @@ def discover_dc(explicit, domain):
     return None
 
 
+def _is_ip(host):
+    try:
+        ipaddress.ip_address(str(host).strip())
+        return True
+    except ValueError:
+        return False
+
+
+def _dc_fqdn(dc, domain=None):
+    """Resolve a DC reference to an FQDN.
+
+    Current-user (SSPI/Kerberos) auth builds the service ticket from the DC's
+    hostname (ldap/<fqdn>), so a bare NetBIOS name like LOGONSERVER gives back
+    (e.g. 'DC01') or an IP can't be used directly. Try DNS, then fall back to
+    stitching the short name onto the domain.
+    """
+    h = str(dc).strip().strip("\\")
+    if not h or "." in h or _is_ip(h):
+        return h
+    try:
+        fq = socket.getfqdn(h)
+        if fq and "." in fq and not _is_ip(fq):
+            return fq
+    except Exception:
+        pass
+    if domain and "." in domain:
+        return f"{h}.{domain}"
+    return h
+
+
 # ----------------------------------------------------------------------------- LDAP
 def _first(v):
     if isinstance(v, (list, tuple)):
@@ -323,12 +356,12 @@ def list_forest_domains(conn, conf_dn, scope):
     return domains
 
 
-def ldap_recon(out, dc, domain, user, password, use_kerberos, use_ssl, page_size, auth,
+def ldap_recon(out, dc, domain, user, password, integrated, use_ssl, page_size, auth,
                use_gc, no_seal):
     from ldap3 import Server, Connection, ALL, NTLM, SIMPLE, SASL, KERBEROS, SUBTREE
     from ldap3.core.exceptions import LDAPException
 
-    if not use_kerberos:
+    if not integrated:
         if install_md4_shim():
             console.print("[dim][ldap] native MD4 unavailable (OpenSSL 3); "
                           "using built-in MD4 for NTLM.[/dim]")
@@ -339,15 +372,26 @@ def ldap_recon(out, dc, domain, user, password, use_kerberos, use_ssl, page_size
     else:
         port = 636 if use_ssl else 389
         kind = "LDAPS" if use_ssl else "LDAP"
-    console.print(f"[cyan][ldap][/cyan] connecting to {dc}:{port} ({kind})")
+
+    # SSPI/Kerberos forms its service ticket from the DC's hostname, so for
+    # current-user auth we need an FQDN, not a NetBIOS name or an IP.
+    conn_host = _dc_fqdn(dc, domain) if integrated else dc
+    console.print(f"[cyan][ldap][/cyan] connecting to {conn_host}:{port} ({kind})")
     try:
         from ldap3 import ENCRYPT
     except Exception:
         ENCRYPT = None
 
     try:
-        server = Server(dc, port=port, use_ssl=use_ssl, get_info=ALL)
-        if use_kerberos:
+        server = Server(conn_host, port=port, use_ssl=use_ssl, get_info=ALL)
+        if integrated:
+            if _is_ip(conn_host):
+                console.print("[yellow][ldap][/yellow] the DC is an IP address; "
+                              "SSPI/Kerberos needs its hostname to build the ticket. "
+                              "Pass --dc <dc.fqdn>, or use --user 'DOMAIN\\user' for "
+                              "an NTLM bind.")
+            console.print("[cyan][ldap][/cyan] binding as the current logged-in "
+                          "Windows user (SSPI/Kerberos, no password)")
             conn = Connection(server, authentication=SASL, sasl_mechanism=KERBEROS,
                               auto_bind=False)
         elif user and password:
@@ -370,7 +414,8 @@ def ldap_recon(out, dc, domain, user, password, use_kerberos, use_ssl, page_size
             conn = Connection(server, **kwargs)
         else:
             console.print("[red][ldap][/red] no usable credentials "
-                          "(give --user with --password, or --kerberos).")
+                          "(omit --user to bind as the current Windows user, or give "
+                          "--user with --password).")
             return
     except LDAPException as e:
         console.print(f"[red][ldap][/red] connection setup failed: {e}")
@@ -384,6 +429,21 @@ def ldap_recon(out, dc, domain, user, password, use_kerberos, use_ssl, page_size
         ok = conn.bind()
     except LDAPException as e:
         console.print(f"[red][ldap][/red] bind error: {e}")
+        low = str(e).lower()
+        if integrated and any(k in low for k in
+                              ("kerberos", "gssapi", "sspi", "package", "winkerberos")):
+            console.print("[dim]Current-user auth needs the Windows Kerberos backend. "
+                          "Install it with:\n"
+                          "    pip install winkerberos\n"
+                          "then re-run. Or fall back to an explicit credential with "
+                          "--user 'DOMAIN\\user'.[/dim]")
+        return
+    except Exception as e:
+        console.print(f"[red][ldap][/red] bind error: {e}")
+        if integrated:
+            console.print("[dim]Current-user auth needs the Windows Kerberos backend "
+                          "(pip install winkerberos), a domain-joined machine, and the "
+                          "DC reachable by hostname. Or use --user 'DOMAIN\\user'.[/dim]")
         return
     if not ok:
         reason = explain_bind(conn)
@@ -394,7 +454,7 @@ def ldap_recon(out, dc, domain, user, password, use_kerberos, use_ssl, page_size
         # Only retry with sealing for transport/signing failures. NEVER retry on
         # invalidCredentials -- another attempt just raises badPwdCount and can
         # lock the account.
-        if (transport_fail and not use_kerberos and user and password and not use_ssl
+        if (transport_fail and not integrated and user and password and not use_ssl
                 and ENCRYPT and choose_auth(user, auth)[0] == "ntlm" and not no_seal
                 and conn.session_security != ENCRYPT):
             console.print("[yellow][ldap][/yellow] retrying NTLM with sealing...")
@@ -413,7 +473,13 @@ def ldap_recon(out, dc, domain, user, password, use_kerberos, use_ssl, page_size
                 console.print(f"[red][ldap][/red] sealed retry error: {e}")
 
         if not ok:
-            if "52e" in reason or desc == "invalidCredentials":
+            if integrated:
+                console.print("[dim]The current Windows user was rejected by the DC. "
+                              "Check that the machine is domain-joined and the DC is "
+                              "reachable by hostname (Kerberos can't use an IP). If the "
+                              "DC enforces LDAPS channel binding, add --ssl. To run as "
+                              "another account instead, use --user 'DOMAIN\\user'.[/dim]")
+            elif "52e" in reason or desc == "invalidCredentials":
                 console.print(
                     "[yellow]This is a genuine credential rejection, not a "
                     "transport problem. The script will NOT retry, because each "
@@ -627,24 +693,35 @@ def run_ldap(args):
     if domain:
         console.print(f"[cyan][ldap][/cyan] domain: {domain}")
 
-    # Resolve the password without letting the shell mangle special characters:
-    # explicit --password wins, then $LDAP_PASSWORD, then a hidden prompt.
-    if not args.kerberos and args.user and not args.password:
-        env_pw = os.environ.get("LDAP_PASSWORD")
-        if env_pw is not None:
-            args.password = env_pw
-            console.print("[dim][ldap] using password from $LDAP_PASSWORD[/dim]")
-        else:
-            import getpass
-            try:
-                args.password = getpass.getpass(f"Password for {args.user}: ")
-            except (EOFError, KeyboardInterrupt):
-                console.print("\n[red][ldap][/red] no password provided.")
-                return
+    # Default: bind as the current logged-in Windows user (SSPI/Kerberos). An
+    # explicit --user switches to that credential instead; --kerberos forces the
+    # current-user path even if a --user was given.
+    integrated = args.kerberos or not args.user
+    if integrated:
+        if args.user or args.password:
+            console.print("[yellow][ldap][/yellow] ignoring --user/--password; "
+                          "binding as the current logged-in Windows user.")
+        console.print("[cyan][ldap][/cyan] authenticating as the current Windows "
+                      "user (no username or password needed).")
+    else:
+        # Resolve the password without letting the shell mangle special characters:
+        # explicit --password wins, then $LDAP_PASSWORD, then a hidden prompt.
+        if not args.password:
+            env_pw = os.environ.get("LDAP_PASSWORD")
+            if env_pw is not None:
+                args.password = env_pw
+                console.print("[dim][ldap] using password from $LDAP_PASSWORD[/dim]")
+            else:
+                import getpass
+                try:
+                    args.password = getpass.getpass(f"Password for {args.user}: ")
+                except (EOFError, KeyboardInterrupt):
+                    console.print("\n[red][ldap][/red] no password provided.")
+                    return
 
     try:
         ldap_recon(out, dc, domain, args.user, args.password,
-                   args.kerberos, args.ssl, args.page_size, args.auth, args.gc,
+                   integrated, args.ssl, args.page_size, args.auth, args.gc,
                    args.no_seal)
     except KeyboardInterrupt:
         console.print("\n[yellow]Ctrl-C -- saving what we have...[/yellow]")
@@ -730,13 +807,19 @@ def main():
 
     p_ldap = sub.add_parser("ldap", help="Active Directory discovery over LDAP")
     p_ldap.add_argument("-o", "--outdir", default=argparse.SUPPRESS)
-    p_ldap.add_argument("--dc", help="domain controller host/IP (auto if omitted)")
+    p_ldap.add_argument("--dc", help="domain controller host/IP (auto if omitted). "
+                        "For current-user auth pass a hostname/FQDN, not an IP")
     p_ldap.add_argument("--domain", help="AD domain FQDN (auto if omitted)")
-    p_ldap.add_argument("--user", help="DOMAIN\\user or user@domain.tld")
+    p_ldap.add_argument("--user", help="run as this account instead of the current "
+                        "Windows user: DOMAIN\\user (NTLM) or user@domain.tld (simple)")
     p_ldap.add_argument("--password", help="password for --user. If omitted, taken "
                         "from $LDAP_PASSWORD or a hidden prompt (avoids shell "
                         "mangling of special characters)")
-    p_ldap.add_argument("--kerberos", action="store_true", help="use current ticket")
+    p_ldap.add_argument("--kerberos", "--current-user", dest="kerberos",
+                        action="store_true",
+                        help="force binding as the current logged-in Windows user via "
+                             "SSPI/Kerberos (this is already the default when no "
+                             "--user is given)")
     p_ldap.add_argument("--auth", choices=["auto", "ntlm", "simple"], default="auto",
                         help="bind method: auto picks NTLM for DOMAIN\\user, "
                              "simple for user@domain.tld (default auto)")

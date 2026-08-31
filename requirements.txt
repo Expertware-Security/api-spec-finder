@@ -7,6 +7,9 @@ openpyxl>=3.1
 ldap3>=2.9
 psutil>=5.9
 dnspython>=2.4
+# current-user (SSPI/Kerberos) LDAP bind -- the default when no --user is given
+winkerberos>=0.9 ; sys_platform == "win32"
+gssapi>=1.8 ; sys_platform != "win32"
 
 # shared
 rich>=13.7
