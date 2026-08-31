@@ -212,6 +212,21 @@ see a one-line note that it fell back to the built-in MD4. If you would rather
 avoid NTLM entirely, the UPN plus `--ssl` simple bind or `--kerberos` both skip
 MD4.
 
+If you got `automatic bind not successful`, the credentials reached the DC and it
+rejected the bind. The script now does the bind by hand and prints the real
+reason, including the Active Directory sub-code when there is one. Common ones:
+`52e` is a wrong username or password, `775` is a locked account, `532` is an
+expired password, `533` is a disabled account. If the message mentions
+`unwillingToPerform` or `strongAuthRequired`, the DC is enforcing LDAP signing or
+channel binding rather than rejecting your password.
+
+For a hardened DC that requires signing, NTLM sealing usually fixes it, and the
+script turns sealing on by default over plain LDAP and also retries with it once
+automatically. If sealing is not enough, use LDAPS with `--ssl`, or authenticate
+with `--kerberos`. A UPN plus `--ssl` gives a TLS simple bind, which satisfies the
+secure-channel requirement a different way. You can turn sealing off with
+`--no-seal` if you ever need to.
+
 If you would rather use the Kerberos ticket you already have on a domain-joined
 box, use `--kerberos` instead of a password, though that needs a working GSSAPI
 or SSPI setup. If you leave off `--dc` and `--domain`, the script tries to work

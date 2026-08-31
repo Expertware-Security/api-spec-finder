@@ -265,6 +265,39 @@ def choose_auth(user, forced):
                   "(for a simple bind). In PowerShell quote it: --user 'CONTOSO\\jdoe'.")
 
 
+AD_SUBCODES = {
+    "52e": "invalid credentials (wrong username or password)",
+    "525": "user not found",
+    "530": "not permitted to log on at this time",
+    "531": "not permitted to log on at this workstation",
+    "532": "password expired",
+    "533": "account disabled",
+    "701": "account expired",
+    "773": "user must reset password before logging on",
+    "775": "account locked out",
+}
+
+
+def explain_bind(conn):
+    """Human-readable reason from conn.result after a failed bind."""
+    r = conn.result or {}
+    desc = r.get("description", "")
+    msg = r.get("message", "") or ""
+    m = re.search(r"data ([0-9a-fA-F]+)", msg)
+    if m:
+        code = m.group(1).lower()
+        if code in AD_SUBCODES:
+            return f"{desc}: {AD_SUBCODES[code]} (AD code {code})"
+    hints = {
+        "strongAuthRequired": "the DC requires a secure channel; use --ssl "
+                              "(LDAPS) for a simple bind, or NTLM with sealing.",
+        "invalidCredentials": "username or password rejected.",
+        "unwillingToPerform": "DC refused; often LDAP signing/channel binding "
+                              "enforcement. Try --ssl, or NTLM with sealing.",
+    }
+    return f"{desc}. {hints.get(desc, msg)}".strip()
+
+
 def list_forest_domains(conn, conf_dn, scope):
     """Return [(dnsRoot, nCName)] for every domain partition in the forest.
 
@@ -291,7 +324,7 @@ def list_forest_domains(conn, conf_dn, scope):
 
 
 def ldap_recon(out, dc, domain, user, password, use_kerberos, use_ssl, page_size, auth,
-               use_gc):
+               use_gc, no_seal):
     from ldap3 import Server, Connection, ALL, NTLM, SIMPLE, SASL, KERBEROS, SUBTREE
     from ldap3.core.exceptions import LDAPException
 
@@ -308,32 +341,76 @@ def ldap_recon(out, dc, domain, user, password, use_kerberos, use_ssl, page_size
         kind = "LDAPS" if use_ssl else "LDAP"
     console.print(f"[cyan][ldap][/cyan] connecting to {dc}:{port} ({kind})")
     try:
+        from ldap3 import ENCRYPT
+    except Exception:
+        ENCRYPT = None
+
+    try:
         server = Server(dc, port=port, use_ssl=use_ssl, get_info=ALL)
         if use_kerberos:
             conn = Connection(server, authentication=SASL, sasl_mechanism=KERBEROS,
-                              auto_bind=True)
+                              auto_bind=False)
         elif user and password:
             method, reason = choose_auth(user, auth)
             if method is None:
                 console.print(f"[red][ldap][/red] {reason}")
                 return
+            ldap_auth = NTLM if method == "ntlm" else SIMPLE
+            kwargs = dict(user=user, password=password, authentication=ldap_auth,
+                          auto_bind=False)
+            # NTLM sealing satisfies most "LDAP signing required" DCs over plain 389.
+            seal = (method == "ntlm" and not use_ssl and not no_seal and ENCRYPT)
+            if seal:
+                kwargs["session_security"] = ENCRYPT
             if method == "simple" and not use_ssl:
                 console.print("[yellow][ldap][/yellow] simple bind over plain LDAP "
                               "sends the password in cleartext. Add --ssl for LDAPS.")
-            ldap_auth = NTLM if method == "ntlm" else SIMPLE
-            console.print(f"[cyan][ldap][/cyan] bind as {user} ({method})")
-            conn = Connection(server, user=user, password=password,
-                              authentication=ldap_auth, auto_bind=True)
+            console.print(f"[cyan][ldap][/cyan] bind as {user} ({method}"
+                          f"{', sealed' if seal else ''})")
+            conn = Connection(server, **kwargs)
         else:
             console.print("[red][ldap][/red] no usable credentials "
                           "(give --user with --password, or --kerberos).")
             return
     except LDAPException as e:
-        console.print(f"[red][ldap][/red] bind failed: {e}")
+        console.print(f"[red][ldap][/red] connection setup failed: {e}")
         return
     except Exception as e:
         console.print(f"[red][ldap][/red] connection error: {e}")
         return
+
+    # manual bind so we can report the real reason
+    try:
+        ok = conn.bind()
+    except LDAPException as e:
+        console.print(f"[red][ldap][/red] bind error: {e}")
+        return
+    if not ok:
+        console.print(f"[red][ldap][/red] bind rejected: {explain_bind(conn)}")
+        # one automatic retry: add NTLM sealing if we did not already
+        if (not use_kerberos and user and password and not use_ssl and ENCRYPT
+                and choose_auth(user, auth)[0] == "ntlm" and not no_seal
+                and conn.session_security != ENCRYPT):
+            console.print("[yellow][ldap][/yellow] retrying NTLM with sealing...")
+            try:
+                conn2 = Connection(server, user=user, password=password,
+                                   authentication=NTLM, session_security=ENCRYPT,
+                                   auto_bind=False)
+                if conn2.bind():
+                    conn = conn2
+                    console.print("[green][ldap][/green] sealed NTLM bind succeeded.")
+                    ok = True
+                else:
+                    console.print(f"[red][ldap][/red] sealed retry also rejected: "
+                                  f"{explain_bind(conn2)}")
+            except Exception as e:
+                console.print(f"[red][ldap][/red] sealed retry error: {e}")
+        if not ok:
+            console.print("[dim]If the DC enforces channel binding on LDAPS, or "
+                          "signing on 389, try: --ssl for LDAPS, or --kerberos with "
+                          "a valid ticket. UPN + --ssl does a TLS simple bind.[/dim]")
+            return
+    console.print("[green][ldap][/green] bind ok.")
 
     info = server.info
     base_dn = info.other.get("defaultNamingContext", [None])[0] if info else None
@@ -525,7 +602,8 @@ def run_ldap(args):
         console.print(f"[cyan][ldap][/cyan] domain: {domain}")
     try:
         ldap_recon(out, dc, domain, args.user, args.password,
-                   args.kerberos, args.ssl, args.page_size, args.auth, args.gc)
+                   args.kerberos, args.ssl, args.page_size, args.auth, args.gc,
+                   args.no_seal)
     except KeyboardInterrupt:
         console.print("\n[yellow]Ctrl-C -- saving what we have...[/yellow]")
     out.dump()
@@ -622,6 +700,9 @@ def main():
     p_ldap.add_argument("--gc", action="store_true",
                         help="query the Global Catalog (port 3268/3269) to enumerate "
                              "computers across ALL domains in the forest")
+    p_ldap.add_argument("--no-seal", action="store_true",
+                        help="disable NTLM sealing (sealing is on by default over "
+                             "plain LDAP to satisfy DCs that require signing)")
     p_ldap.add_argument("--page-size", type=int, default=500)
     p_ldap.set_defaults(func=run_ldap)
 
