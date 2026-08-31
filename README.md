@@ -111,7 +111,14 @@ repeating work.
   name and an `.xlsx` extension (default `api_recon.jsonl`)
 - `-w, --workers` how many hosts to scan at once (default 20)
 - `-t, --timeout` per-request timeout in seconds (default 7)
-- `--ports` comma-separated list of ports to override the defaults
+- `--ports` ports to scan instead of the defaults; accepts single ports and
+  ranges, comma- or space-separated, e.g. `--ports '80,443,8000-8100'`
+- `--all-ports` scan all 65535 TCP ports. Runs a fast concurrent connect sweep
+  first and only HTTP-probes the ports that turn out to be open, so it stays
+  practical (see below)
+- `--port-workers` concurrency for that TCP pre-scan, shared across all hosts
+  (default 100)
+- `--port-timeout` connect timeout for the pre-scan in seconds (default 0.5)
 - `--per-api` cap on how many GET endpoints to test per spec, 0 means all
   (default 0). Set this to something like 3 if you only want a quick
   does-it-ask-for-a-token check rather than full coverage.
@@ -157,6 +164,29 @@ in on Windows. Run it from a domain-joined machine so the SSPI handshake can use
 your logon session. Remember this changes what "reachable" means for the authed
 column — it now reflects your own access, so run it as an account whose reach is
 representative of a normal user, not a domain admin.
+
+## Scanning all ports
+
+By default the scanner only touches a short list of common web ports. When a web
+service might be listening anywhere, use `--all-ports` (or a wide `--ports` range
+like `--ports '1-65535'`):
+
+```
+python api_auth_recon.py -i recon_out/hosts.txt -o api_recon.jsonl --all-ports
+```
+
+Probing 65535 ports with a full HTTP request each would be unusably slow, so for
+any large port list the scanner first runs a fast concurrent **TCP connect sweep**
+to find which ports are actually open, and only then HTTP-probes those. The sweep
+is shared across all hosts and capped at `--port-workers` simultaneous connects
+(default 100) with a short `--port-timeout` (default 0.5s), so it does not
+explode into hundreds of thousands of threads. Closed ports reject instantly; the
+timeout only bites on firewalled ports, so in practice this finishes far quicker
+than the raw port count suggests. You will see a `[ports] host: N open of M
+scanned` line per host before it moves on to the HTTP stage.
+
+Ports you pin explicitly as `host:port` in the input file are always honoured as-is
+and skip the sweep; `--all-ports` only widens the hosts that had no explicit port.
 
 ## How results are classified
 

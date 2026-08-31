@@ -63,6 +63,10 @@ console = Console()
 DEFAULT_PORTS = [80, 443, 8080, 8443, 8000, 8888, 5000, 3000,
                  9000, 9090, 8081, 7001, 9443, 10443]
 HTTPS_PORTS = {443, 8443, 9443, 10443, 4443}
+ALL_PORTS = range(1, 65536)
+# above this many ports per host, run a fast concurrent TCP pre-scan and only
+# HTTP-probe the ports that turn out to be open (avoids 65k sequential probes)
+PORT_PRESCAN_THRESHOLD = 64
 
 SWAGGER_PATHS = [
     "/swagger/v1/swagger.json", "/swagger/v2/swagger.json",
@@ -295,6 +299,27 @@ def tcp_open(host, port, timeout=1.5):
         return False
 
 
+def discover_open_ports(pool, host, ports, timeout, batch=1024):
+    """Fast concurrent TCP connect scan over `ports`. Return the open ones, sorted.
+
+    Submits into the SHARED port pool so total in-flight connects stay capped at
+    --port-workers no matter how many hosts scan at once, and works in batches so
+    we never hold 65k pending futures per host.
+    """
+    ports = list(ports)
+    open_ports = []
+    for i in range(0, len(ports), batch):
+        chunk = ports[i:i + batch]
+        futs = {pool.submit(tcp_open, host, p, timeout): p for p in chunk}
+        for fut in as_completed(futs):
+            try:
+                if fut.result():
+                    open_ports.append(futs[fut])
+            except Exception:
+                pass
+    return sorted(open_ports)
+
+
 def probe_http(session, host, port, timeout):
     """Return dict describing a live web service on host:port, or None."""
     if not tcp_open(host, port, timeout=min(timeout, 2.0)):
@@ -481,8 +506,17 @@ def process_host(target, journal, cfg):
     timeout = cfg["timeout"]
     delay = cfg["delay"]
 
+    # For a large port list, TCP-sweep first (fast, concurrent) and only HTTP-probe
+    # the open ports. A short explicit list is probed directly as before.
+    scan_ports = ports
+    port_pool = cfg.get("port_pool")
+    if port_pool is not None and len(ports) > PORT_PRESCAN_THRESHOLD:
+        scan_ports = discover_open_ports(port_pool, host, ports, cfg["port_timeout"])
+        console.print(f"[dim][ports] {host}: {len(scan_ports)} open of "
+                      f"{len(ports)} scanned[/dim]")
+
     web_services = []
-    for port in ports:
+    for port in scan_ports:
         svc = probe_http(session, host, port, timeout)
         if svc:
             journal.write({"type": "web", **svc})
@@ -579,6 +613,34 @@ def process_host(target, journal, cfg):
 
 
 # ----------------------------------------------------------------------------- input parsing
+def parse_ports(spec):
+    """Parse a port spec into a sorted list. Accepts single ports and ranges,
+    comma- or space-separated, e.g. '80,443,8000-8100'."""
+    ports = set()
+    for tok in re.split(r"[,\s]+", spec.strip()):
+        if not tok:
+            continue
+        if "-" in tok:
+            a, _, b = tok.partition("-")
+            try:
+                lo, hi = int(a), int(b)
+            except ValueError:
+                console.print(f"[yellow]skipping bad port range: {tok}[/yellow]")
+                continue
+            if lo > hi:
+                lo, hi = hi, lo
+            ports.update(range(max(1, lo), min(65535, hi) + 1))
+        else:
+            try:
+                p = int(tok)
+            except ValueError:
+                console.print(f"[yellow]skipping bad port: {tok}[/yellow]")
+                continue
+            if 1 <= p <= 65535:
+                ports.add(p)
+    return sorted(ports)
+
+
 def read_targets(path, default_ports):
     targets = {}
     with open(path, "r", encoding="utf-8") as fh:
@@ -614,7 +676,17 @@ def main():
                     help="journal path (.jsonl). Excel is <out>.xlsx (default: api_recon.jsonl)")
     ap.add_argument("-w", "--workers", type=int, default=20, help="concurrent hosts (default 20)")
     ap.add_argument("-t", "--timeout", type=float, default=7.0, help="per-request timeout s (default 7)")
-    ap.add_argument("--ports", help="comma list of ports to override defaults")
+    ap.add_argument("--ports", help="ports to scan instead of the defaults; accepts "
+                    "single ports and ranges, e.g. '80,443,8000-8100'")
+    ap.add_argument("--all-ports", action="store_true",
+                    help="scan all 65535 TCP ports. Runs a fast concurrent connect "
+                         "sweep first, then HTTP-probes only the open ports")
+    ap.add_argument("--port-workers", type=int, default=100,
+                    help="concurrency for the TCP port pre-scan, shared across hosts "
+                         "(default 100)")
+    ap.add_argument("--port-timeout", type=float, default=0.5,
+                    help="connect timeout for the TCP port pre-scan in seconds "
+                         "(default 0.5)")
     ap.add_argument("--per-api", type=int, default=0,
                     help="max GET endpoints tested per swagger (0 = all, default 0)")
     ap.add_argument("--delay", type=float, default=0.0, help="delay between requests s (rate limit)")
@@ -660,8 +732,25 @@ def main():
                       "anonymously AND as the current Windows user; the report gets an "
                       "Access Matrix sheet. [dim](this doubles the request count)[/dim]")
 
-    default_ports = ([int(p) for p in args.ports.split(",")] if args.ports else DEFAULT_PORTS)
+    if args.all_ports:
+        default_ports = list(ALL_PORTS)
+    elif args.ports:
+        default_ports = parse_ports(args.ports)
+        if not default_ports:
+            ap.error("--ports parsed to no valid ports")
+    else:
+        default_ports = DEFAULT_PORTS
     targets = read_targets(args.input, default_ports)
+
+    # Shared, bounded pool for the TCP port pre-scan. Created only when some host
+    # actually has a large port list, so a normal small-list run is unaffected.
+    biggest = max((len(t["ports"]) for t in targets), default=0)
+    port_pool = (ThreadPoolExecutor(max_workers=args.port_workers)
+                 if biggest > PORT_PRESCAN_THRESHOLD else None)
+    if port_pool is not None:
+        console.print(f"[cyan]port pre-scan:[/cyan] up to {biggest} ports/host, "
+                      f"{args.port_workers} concurrent connects @ {args.port_timeout}s "
+                      f"timeout. [dim]Only open ports get HTTP-probed.[/dim]")
 
     done = journal.done_hosts()
     pending = [t for t in targets if t["host"] not in done]
@@ -675,7 +764,8 @@ def main():
 
     cfg = {"ua": args.ua, "timeout": args.timeout, "delay": args.delay,
            "retries": args.retries, "per_api": args.per_api,
-           "current_user": args.current_user}
+           "current_user": args.current_user,
+           "port_pool": port_pool, "port_timeout": args.port_timeout}
 
     # ------- finalize hooks (signal / atexit) so Excel is always saved
     _finalized = threading.Event()
@@ -684,6 +774,8 @@ def main():
         if _finalized.is_set():
             return
         _finalized.set()
+        if port_pool is not None:
+            port_pool.shutdown(wait=False)
         try:
             build_excel(journal.snapshot(), out_xlsx)
             console.print(f"\n[bold green]Saved Excel:[/bold green] {out_xlsx}")
