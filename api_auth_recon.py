@@ -20,8 +20,15 @@ Crash-safety:
 Only idempotent GET requests are sent. Paths that look state-changing are skipped.
 
 NOTE (Windows domain-joined): the `requests` library does NOT auto-send your
-Kerberos/NTLM credentials the way a browser / WinHTTP would, so these results
-reflect TRUE anonymous access -- which is exactly what this test wants.
+Kerberos/NTLM credentials the way a browser / WinHTTP would, so by default these
+results reflect TRUE anonymous access -- which is exactly what this test wants.
+
+--current-user adds a SECOND, opt-in check on top of that: for each endpoint that
+came back PROTECTED behind NTLM/Negotiate, it retries once as the current
+logged-in Windows user (SSPI, no password) and records whether it opens up, in a
+separate 'auth_as_user' column. The anonymous verdict is never overwritten, so
+you keep both signals: what is open to anyone, and what any domain user can reach.
+Needs the requests-negotiate-sspi package (Windows only).
 """
 
 import argparse
@@ -34,6 +41,7 @@ import socket
 import sys
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
@@ -141,6 +149,10 @@ def build_excel(records, out_xlsx):
     unauth_fill = PatternFill("solid", fgColor="FFC7CE")   # red-ish
     unauth_font = Font(color="9C0006", bold=True)
     warn_fill = PatternFill("solid", fgColor="FFEB9C")     # amber
+    open_fill = PatternFill("solid", fgColor="C6EFCE")     # green (locked / denied-as-user)
+    open_font = Font(color="006100", bold=True)
+    esc_fill = PatternFill("solid", fgColor="E4C6F0")      # purple (domain-user escalation)
+    esc_font = Font(color="6B1F8A", bold=True)
 
     def style_header(ws, ncols):
         for c in range(1, ncols + 1):
@@ -179,8 +191,9 @@ def build_excel(records, out_xlsx):
 
     # ---- Endpoints sheet (the money sheet)
     ws = wb.create_sheet("Endpoints")
-    ep_cols = ["verdict", "method", "url", "status", "www_authenticate",
-               "location", "content_type", "resp_len", "swagger_url", "ts"]
+    ep_cols = ["verdict", "auth_as_user", "access", "method", "url", "status",
+               "www_authenticate", "location", "content_type", "resp_len",
+               "swagger_url", "ts"]
     ws.append(ep_cols)
     row_i = 1
     for r in records:
@@ -189,17 +202,75 @@ def build_excel(records, out_xlsx):
         row_i += 1
         ws.append([r.get(k, "") for k in ep_cols])
         verdict = r.get("verdict", "")
+        access = r.get("access", "")
         if verdict == "UNAUTHENTICATED":
             for c in range(1, len(ep_cols) + 1):
                 ws.cell(row=row_i, column=c).fill = unauth_fill
             ws.cell(row=row_i, column=1).font = unauth_font
         elif verdict in ("200-AUTH-BODY", "OTHER", "ERROR"):
             ws.cell(row=row_i, column=1).fill = warn_fill
+        # access-matrix column (col 3): flag the escalation, mark the locked ones
+        if access == "DOMAIN-USER":
+            for c in range(1, len(ep_cols) + 1):
+                ws.cell(row=row_i, column=c).fill = esc_fill
+            ws.cell(row=row_i, column=3).font = esc_font
+        elif access == "LOCKED":
+            ws.cell(row=row_i, column=3).fill = open_fill
+            ws.cell(row=row_i, column=3).font = open_font
     style_header(ws, len(ep_cols))
     autosize(ws)
 
     # auto-filter on endpoints
     ws.auto_filter.ref = ws.dimensions
+
+    # ---- Access Matrix sheet (only when a --current-user pass produced authed results)
+    authed_recs = [r for r in records
+                   if r.get("type") == "endpoint" and r.get("auth_as_user")]
+    if authed_recs:
+        ws = wb.create_sheet("Access Matrix")
+        anon_axis = sorted({r.get("verdict", "") for r in authed_recs})
+        authed_axis = sorted({r.get("auth_as_user", "") for r in authed_recs})
+        pair = Counter((r.get("verdict", ""), r.get("auth_as_user", ""))
+                       for r in authed_recs)
+
+        # cross-tab: anonymous verdict (rows) x current-user verdict (cols)
+        ws.append(["anonymous \\ current-user"] + authed_axis + ["row total"])
+        for a in anon_axis:
+            row = [a] + [pair.get((a, b), 0) for b in authed_axis]
+            row.append(sum(pair.get((a, b), 0) for b in authed_axis))
+            ws.append(row)
+        ws.append(["col total"]
+                  + [sum(pair.get((a, b), 0) for a in anon_axis) for b in authed_axis]
+                  + [len(authed_recs)])
+        style_header(ws, len(authed_axis) + 2)
+        for r_i in range(2, 3 + len(anon_axis)):
+            ws.cell(row=r_i, column=1).font = Font(bold=True)
+
+        # access-class rollup underneath the cross-tab
+        classes = Counter(r.get("access", "") for r in authed_recs)
+        meaning = {
+            "OPEN-TO-ALL": "reachable with NO credentials -- top priority",
+            "DOMAIN-USER": "denied anonymously, opens to any logged-in domain user",
+            "LOCKED": "denied both anonymously and as the current user",
+            "OTHER": "redirects / errors / mixed -- check manually",
+        }
+        cls_fill = {"OPEN-TO-ALL": unauth_fill, "DOMAIN-USER": esc_fill,
+                    "LOCKED": open_fill}
+        start = len(anon_axis) + 4
+        for j, label in enumerate(("Access class", "count", "meaning"), start=1):
+            ws.cell(row=start, column=j, value=label).font = Font(bold=True)
+        ri = start
+        for cls in ("OPEN-TO-ALL", "DOMAIN-USER", "LOCKED", "OTHER"):
+            if not classes.get(cls):
+                continue
+            ri += 1
+            ws.cell(row=ri, column=1, value=cls)
+            ws.cell(row=ri, column=2, value=classes[cls])
+            ws.cell(row=ri, column=3, value=meaning[cls])
+            if cls in cls_fill:
+                for c in (1, 2, 3):
+                    ws.cell(row=ri, column=c).fill = cls_fill[cls]
+        autosize(ws)
 
     tmp = out_xlsx + ".tmp"
     wb.save(tmp)
@@ -358,6 +429,49 @@ def classify(resp):
     return "OTHER", detail
 
 
+# ----------------------------------------------------------------------------- current-user auth
+# Normalised authed verdicts (short, since they head the access-matrix columns).
+_AUTHED_NAMES = {"UNAUTHENTICATED": "OPEN", "200-AUTH-BODY": "AUTH-BODY",
+                 "PROTECTED": "DENIED"}
+
+
+def _negotiate_auth():
+    """A fresh SSPI Negotiate/NTLM auth handler bound to the current logon session.
+
+    New instance per request: the handler carries per-exchange state, so sharing
+    one across the worker threads would be unsafe.
+    """
+    from requests_negotiate_sspi import HttpNegotiateAuth
+    return HttpNegotiateAuth()
+
+
+def probe_as_current_user(session, url, timeout):
+    """GET url as the current Windows user (SSPI). Return a short authed verdict."""
+    try:
+        auth = _negotiate_auth()
+    except Exception:
+        return "no-sspi"
+    try:
+        r = session.get(url, timeout=timeout, verify=False,
+                        allow_redirects=False, auth=auth)
+    except requests.RequestException:
+        return "error"
+    v, _ = classify(r)
+    return _AUTHED_NAMES.get(v, v)
+
+
+def access_class(anon, authed):
+    """Collapse an (anonymous, current-user) verdict pair into one access class."""
+    if anon == "UNAUTHENTICATED":
+        return "OPEN-TO-ALL"          # reachable with no credentials at all
+    if authed == "OPEN":
+        return "DOMAIN-USER"          # denied anon, opens to any logged-in user
+    if (anon in ("PROTECTED", "REDIRECT-SSO", "200-AUTH-BODY")
+            and authed in ("DENIED", "AUTH-BODY", "REDIRECT-SSO")):
+        return "LOCKED"               # denied both ways
+    return "OTHER"                    # redirects / errors / mixed
+
+
 # ----------------------------------------------------------------------------- per-host worker
 def process_host(target, journal, cfg):
     """Full chain for one host. Emits records as it goes, then host_done."""
@@ -411,6 +525,7 @@ def process_host(target, journal, cfg):
                                     allow_redirects=False)
                 except requests.RequestException as e:
                     journal.write({"type": "endpoint", "verdict": "ERROR",
+                                   "auth_as_user": "", "access": "",
                                    "method": "GET", "url": url, "status": "",
                                    "www_authenticate": "", "location": "",
                                    "content_type": "", "resp_len": 0,
@@ -419,17 +534,35 @@ def process_host(target, journal, cfg):
                         time.sleep(delay)
                     continue
                 verdict, detail = classify(r)
+
+                # opt-in second pass: same endpoint as the current Windows user,
+                # so every row carries both an anonymous and an authed result.
+                authed, access = "", ""
+                if cfg["current_user"]:
+                    if delay:
+                        time.sleep(delay)
+                    authed = probe_as_current_user(session, url, timeout)
+                    access = access_class(verdict, authed)
+
                 journal.write({"type": "endpoint", "verdict": verdict,
+                               "auth_as_user": authed, "access": access,
                                "method": "GET", "url": url,
                                "swagger_url": swurl, **detail})
                 if verdict == "UNAUTHENTICATED":
                     console.print(
                         f"  [bold red][UNAUTH][/bold red] GET {url} -> "
                         f"{detail['status']}  [red]<-- no auth[/red]")
-                elif verdict == "PROTECTED":
+                elif access == "DOMAIN-USER":
                     scheme = detail["www_authenticate"].split(" ")[0] if detail["www_authenticate"] else ""
                     console.print(
-                        f"  [dim][ok] GET {url} -> {detail['status']} {scheme}[/dim]")
+                        f"  [bold magenta][DOMAIN-USER][/bold magenta] GET {url} -> "
+                        f"anon {detail['status']} {scheme} "
+                        f"[magenta]<-- opens to current user[/magenta]")
+                elif verdict == "PROTECTED":
+                    scheme = detail["www_authenticate"].split(" ")[0] if detail["www_authenticate"] else ""
+                    tail = f" [dim](as-user: {authed})[/dim]" if authed else ""
+                    console.print(
+                        f"  [dim][ok] GET {url} -> {detail['status']} {scheme}[/dim]{tail}")
                 elif verdict.startswith("REDIRECT"):
                     console.print(
                         f"  [yellow][redir][/yellow] GET {url} -> {detail['status']} "
@@ -486,6 +619,11 @@ def main():
                     help="max GET endpoints tested per swagger (0 = all, default 0)")
     ap.add_argument("--delay", type=float, default=0.0, help="delay between requests s (rate limit)")
     ap.add_argument("--retries", type=int, default=0, help="request retries (default 0)")
+    ap.add_argument("--current-user", action="store_true",
+                    help="also test every endpoint as the current logged-in Windows "
+                         "user (SSPI Negotiate/NTLM, no password) and build an access "
+                         "matrix of anonymous vs current-user access. Doubles the "
+                         "request count. Needs requests-negotiate-sspi (Windows)")
     ap.add_argument("--ua", default="API-Auth-Recon/1.0 (authorized assessment)",
                     help="User-Agent")
     ap.add_argument("--snapshot-every", type=int, default=20,
@@ -508,6 +646,20 @@ def main():
     if not args.input:
         ap.error("--input is required (unless --rebuild)")
 
+    if args.current_user:
+        try:
+            _negotiate_auth()   # fail fast with a clear message if the backend is missing
+        except Exception as e:
+            console.print("[red]--current-user needs the SSPI backend, which failed to "
+                          f"load:[/red] {e}")
+            console.print("[dim]Install it on Windows with:  pip install "
+                          "requests-negotiate-sspi[/dim]")
+            journal.close()
+            return
+        console.print("[cyan]current-user mode:[/cyan] each endpoint is checked "
+                      "anonymously AND as the current Windows user; the report gets an "
+                      "Access Matrix sheet. [dim](this doubles the request count)[/dim]")
+
     default_ports = ([int(p) for p in args.ports.split(",")] if args.ports else DEFAULT_PORTS)
     targets = read_targets(args.input, default_ports)
 
@@ -522,7 +674,8 @@ def main():
                   "Re-run same command to resume.[/dim]\n")
 
     cfg = {"ua": args.ua, "timeout": args.timeout, "delay": args.delay,
-           "retries": args.retries, "per_api": args.per_api}
+           "retries": args.retries, "per_api": args.per_api,
+           "current_user": args.current_user}
 
     # ------- finalize hooks (signal / atexit) so Excel is always saved
     _finalized = threading.Event()
@@ -591,10 +744,15 @@ def main():
     n_un = sum(1 for r in recs if r.get("type") == "endpoint" and r.get("verdict") == "UNAUTHENTICATED")
     n_ep = sum(1 for r in recs if r.get("type") == "endpoint")
     finalize()
-    console.print(
-        f"\n[bold]Summary:[/bold] {n_web} web services, {n_sw} swagger specs, "
-        f"{n_ep} GET endpoints tested, "
-        f"[bold red]{n_un} UNAUTHENTICATED[/bold red].")
+    summary = (f"\n[bold]Summary:[/bold] {n_web} web services, {n_sw} swagger specs, "
+               f"{n_ep} GET endpoints tested, "
+               f"[bold red]{n_un} UNAUTHENTICATED[/bold red]")
+    if args.current_user:
+        n_du = sum(1 for r in recs if r.get("type") == "endpoint"
+                   and r.get("access") == "DOMAIN-USER")
+        summary += (f", [bold magenta]{n_du} open to the current domain user"
+                    f"[/bold magenta] (see the Access Matrix sheet)")
+    console.print(summary + ".")
 
 
 if __name__ == "__main__":

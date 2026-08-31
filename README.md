@@ -117,10 +117,46 @@ repeating work.
   does-it-ask-for-a-token check rather than full coverage.
 - `--delay` seconds to wait between requests, for rate limiting
 - `--retries` request retries (default 0)
+- `--current-user` also test every endpoint as the current logged-in Windows user
+  and build an access matrix (see below). Doubles the request count. Windows only.
 - `--ua` the User-Agent string, set by default to something that identifies the
   traffic as an authorized assessment
 - `--snapshot-every` rebuild the Excel file every N finished hosts (default 20)
 - `--rebuild` skip scanning, just rebuild the Excel file from an existing journal
+
+## Testing as the current user (access matrix)
+
+By default the scanner is deliberately anonymous — it never sends your Windows
+credentials, so a result of "open" means open to *anyone*. That is the primary
+finding and it is what you want most of the time.
+
+`--current-user` adds a second, opt-in dimension. With it, every GET endpoint is
+tested twice: once anonymously (as before) and once as the **current logged-in
+Windows user** over SSPI (Negotiate/Kerberos, falling back to NTLM — no password,
+same integrated auth a browser uses). The anonymous verdict is never overwritten;
+the authed result goes in a new `auth_as_user` column, and the two are combined
+into an `access` class per endpoint:
+
+- `OPEN-TO-ALL` — reachable with no credentials at all. Top priority. (red)
+- `DOMAIN-USER` — denied anonymously, but opens to any logged-in domain user.
+  This is the authorization signal: an endpoint any employee can reach that maybe
+  should be locked down further. (purple)
+- `LOCKED` — denied both anonymously and as the current user. (green)
+- `OTHER` — redirects, errors, or mixed results worth a manual look.
+
+The report then gains an **Access Matrix** sheet: a cross-tab of anonymous access
+(rows) against current-user access (columns) with counts, plus a rollup of the
+access classes above. It only appears when you run with `--current-user`.
+
+```
+python api_auth_recon.py -i recon_out/hosts.txt -o api_recon.jsonl --current-user
+```
+
+This needs the `requests-negotiate-sspi` package, which `requirements.txt` pulls
+in on Windows. Run it from a domain-joined machine so the SSPI handshake can use
+your logon session. Remember this changes what "reachable" means for the authed
+column — it now reflects your own access, so run it as an account whose reach is
+representative of a normal user, not a domain admin.
 
 ## How results are classified
 
@@ -149,10 +185,13 @@ against production.
 
 If you run this from a domain-joined Windows machine, note that the `requests`
 library does not automatically send your Kerberos or NTLM credentials the way a
-browser or WinHTTP would. That is actually what you want here, because it means
-the results reflect genuine anonymous access rather than your own logged-in
+browser or WinHTTP would. By default that is exactly what you want, because it
+means the results reflect genuine anonymous access rather than your own logged-in
 session. An API using Integrated Windows Auth will show up as PROTECTED with a
-Negotiate or NTLM value in the `www_authenticate` column, not as open.
+Negotiate or NTLM value in the `www_authenticate` column, not as open. When you
+*do* want to know what your own account can reach on top of that, add
+`--current-user` for the access matrix described above — it keeps the anonymous
+result intact and reports the authed one alongside it.
 
 Keep the authorization paperwork handy for whatever ranges you put in the hosts
 file. The default User-Agent is set to flag the traffic as an authorized
