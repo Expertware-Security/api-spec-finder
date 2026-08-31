@@ -33,11 +33,13 @@ import argparse
 import atexit
 import csv
 import glob
+import hashlib
 import ipaddress
 import os
 import re
 import signal
 import socket
+import struct
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -47,6 +49,90 @@ from rich.console import Console
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 
 console = Console()
+
+
+# ----------------------------------------------------------------------------- MD4 shim
+# OpenSSL 3.x drops MD4 from the default provider, so hashlib.new('md4') fails
+# with "unsupported hash type MD4". NTLM needs MD4 for the NT hash, so we supply
+# a small pure-Python MD4 and route hashlib.new('md4') through it when the native
+# one is missing. No extra packages, no system config changes.
+def _md4_digest(msg):
+    mask = 0xFFFFFFFF
+    def rotl(x, n):
+        return ((x << n) | (x >> (32 - n))) & mask
+    A, B, C, D = 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476
+    G = lambda x, y, z: (x & y) | (x & z) | (y & z)
+    H = lambda x, y, z: x ^ y ^ z
+    ml = len(msg)
+    msg = msg + b"\x80"
+    while len(msg) % 64 != 56:
+        msg += b"\x00"
+    msg += struct.pack("<Q", (ml * 8) & 0xFFFFFFFFFFFFFFFF)
+    for off in range(0, len(msg), 64):
+        X = list(struct.unpack("<16I", msg[off:off + 64]))
+        a, b, c, d = A, B, C, D
+        for k in (0, 4, 8, 12):
+            a = rotl((a + ((b & c) | (~b & d)) + X[k]) & mask, 3)
+            d = rotl((d + ((a & b) | (~a & c)) + X[k + 1]) & mask, 7)
+            c = rotl((c + ((d & a) | (~d & b)) + X[k + 2]) & mask, 11)
+            b = rotl((b + ((c & d) | (~c & a)) + X[k + 3]) & mask, 19)
+        for k in (0, 1, 2, 3):
+            a = rotl((a + G(b, c, d) + X[k] + 0x5a827999) & mask, 3)
+            d = rotl((d + G(a, b, c) + X[k + 4] + 0x5a827999) & mask, 5)
+            c = rotl((c + G(d, a, b) + X[k + 8] + 0x5a827999) & mask, 9)
+            b = rotl((b + G(c, d, a) + X[k + 12] + 0x5a827999) & mask, 13)
+        for k in (0, 2, 1, 3):
+            a = rotl((a + H(b, c, d) + X[k] + 0x6ed9eba1) & mask, 3)
+            d = rotl((d + H(a, b, c) + X[k + 8] + 0x6ed9eba1) & mask, 9)
+            c = rotl((c + H(d, a, b) + X[k + 4] + 0x6ed9eba1) & mask, 11)
+            b = rotl((b + H(c, d, a) + X[k + 12] + 0x6ed9eba1) & mask, 15)
+        A = (A + a) & mask
+        B = (B + b) & mask
+        C = (C + c) & mask
+        D = (D + d) & mask
+    return struct.pack("<4I", A, B, C, D)
+
+
+class _MD4:
+    name = "md4"
+    digest_size = 16
+    block_size = 64
+
+    def __init__(self, data=b""):
+        self._buf = bytearray(data)
+
+    def update(self, data):
+        self._buf += data
+
+    def digest(self):
+        return _md4_digest(bytes(self._buf))
+
+    def hexdigest(self):
+        return self.digest().hex()
+
+    def copy(self):
+        c = _MD4()
+        c._buf = bytearray(self._buf)
+        return c
+
+
+def install_md4_shim():
+    """Route hashlib.new('md4') to the pure-Python MD4 if the native one is gone."""
+    try:
+        hashlib.new("md4")
+        return False           # native MD4 works, nothing to do
+    except Exception:
+        pass
+    _orig_new = hashlib.new
+
+    def _patched_new(name, data=b"", **kw):
+        if str(name).lower() == "md4":
+            return _MD4(data)
+        return _orig_new(name, data, **kw)
+
+    hashlib.new = _patched_new
+    return True
+
 
 DEFAULT_SWEEP_PORTS = [80, 443, 445, 3389, 22, 8080, 8443]
 MAX_SUBNET_HOSTS = 4096          # skip anything bigger than a /20 unless raised
@@ -179,13 +265,48 @@ def choose_auth(user, forced):
                   "(for a simple bind). In PowerShell quote it: --user 'CONTOSO\\jdoe'.")
 
 
-def ldap_recon(out, dc, domain, user, password, use_kerberos, use_ssl, page_size, auth):
+def list_forest_domains(conn, conf_dn, scope):
+    """Return [(dnsRoot, nCName)] for every domain partition in the forest.
+
+    Reads crossRef objects under CN=Partitions,<Configuration>. Domain partitions
+    are the crossRefs whose systemFlags has the DOMAIN bit (0x2) set.
+    """
+    domains = []
+    if not conf_dn:
+        return domains
+    try:
+        conn.search(
+            search_base=f"CN=Partitions,{conf_dn}",
+            search_filter="(&(objectClass=crossRef)"
+                          "(systemFlags:1.2.840.113556.1.4.803:=2))",
+            search_scope=scope, attributes=["dnsRoot", "nCName"])
+        for e in conn.entries:
+            dnsroot = str(e.dnsRoot.value) if "dnsRoot" in e and e.dnsRoot.value else ""
+            ncname = str(e.nCName.value) if "nCName" in e and e.nCName.value else ""
+            if ncname:
+                domains.append((dnsroot.lower(), ncname))
+    except Exception:
+        pass
+    return domains
+
+
+def ldap_recon(out, dc, domain, user, password, use_kerberos, use_ssl, page_size, auth,
+               use_gc):
     from ldap3 import Server, Connection, ALL, NTLM, SIMPLE, SASL, KERBEROS, SUBTREE
     from ldap3.core.exceptions import LDAPException
 
-    port = 636 if use_ssl else 389
-    console.print(f"[cyan][ldap][/cyan] connecting to {dc}:{port} "
-                  f"({'LDAPS' if use_ssl else 'LDAP'})")
+    if not use_kerberos:
+        if install_md4_shim():
+            console.print("[dim][ldap] native MD4 unavailable (OpenSSL 3); "
+                          "using built-in MD4 for NTLM.[/dim]")
+
+    if use_gc:
+        port = 3269 if use_ssl else 3268
+        kind = "Global Catalog (LDAPS)" if use_ssl else "Global Catalog"
+    else:
+        port = 636 if use_ssl else 389
+        kind = "LDAPS" if use_ssl else "LDAP"
+    console.print(f"[cyan][ldap][/cyan] connecting to {dc}:{port} ({kind})")
     try:
         server = Server(dc, port=port, use_ssl=use_ssl, get_info=ALL)
         if use_kerberos:
@@ -217,39 +338,69 @@ def ldap_recon(out, dc, domain, user, password, use_kerberos, use_ssl, page_size
     info = server.info
     base_dn = info.other.get("defaultNamingContext", [None])[0] if info else None
     conf_dn = info.other.get("configurationNamingContext", [None])[0] if info else None
+    root_dn = info.other.get("rootDomainNamingContext", [None])[0] if info else None
     if not base_dn:
         console.print("[red][ldap][/red] could not read defaultNamingContext.")
         conn.unbind()
         return
-    console.print(f"[cyan][ldap][/cyan] base DN: {base_dn}")
+
+    # discover every domain partition in the forest (from Configuration/Partitions)
+    domains = list_forest_domains(conn, conf_dn, SUBTREE)  # [(dnsRoot, nCName), ...]
+    if domains:
+        tag = " (root)" if root_dn else ""
+        console.print(f"[cyan][ldap][/cyan] forest domains{tag}: "
+                      + ", ".join(d for d, _ in domains))
+
+    # decide which naming contexts to enumerate computers from
+    if use_gc:
+        search_bases = [(dnsroot, nc) for dnsroot, nc in domains] or \
+                       [(domain or base_dn, base_dn)]
+    else:
+        this = next((d for d, nc in domains if nc == base_dn), domain or base_dn)
+        search_bases = [(this, base_dn)]
+        if len(domains) > 1:
+            console.print("[yellow][ldap][/yellow] this is a single-domain scan. "
+                          f"The forest has {len(domains)} domains -- add --gc to "
+                          "enumerate all of them via the Global Catalog.")
 
     comp_filter = ("(&(objectCategory=computer)(objectClass=computer)"
                    "(!(userAccountControl:1.2.840.113556.1.4.803:=2)))")
-    n_comp = 0
-    try:
-        entries = conn.extend.standard.paged_search(
-            search_base=base_dn, search_filter=comp_filter, search_scope=SUBTREE,
-            attributes=["dNSHostName", "name", "operatingSystem", "servicePrincipalName"],
-            paged_size=page_size, generator=True)
-        for e in entries:
-            if e.get("type") != "searchResEntry":
-                continue
-            a = e["attributes"]
-            dns_name = _first(a.get("dNSHostName"))
-            name = _first(a.get("name"))
-            os_name = _first(a.get("operatingSystem")) or ""
-            http_hosts = _http_spn_hosts(a.get("servicePrincipalName") or [], domain)
-            spn_str = ";".join(f"{h}:{p}" if p else h for h, p in http_hosts)
-            host = dns_name or (f"{name}.{domain}" if (name and domain) else name)
-            if host:
-                out.add_host(host, source="ldap-computer", os_name=os_name, spns=spn_str)
-                n_comp += 1
-            for h, p in http_hosts:
-                out.add_host(h, port=p, source="ldap-http-spn", os_name=os_name)
-        console.print(f"[green][ldap][/green] {n_comp} computers, HTTP SPNs folded in.")
-        out.dump()
-    except Exception as e:
-        console.print(f"[red][ldap][/red] computer search error: {e}")
+    total = 0
+    for dnsroot, nc in search_bases:
+        n_dom = 0
+        try:
+            entries = conn.extend.standard.paged_search(
+                search_base=nc, search_filter=comp_filter, search_scope=SUBTREE,
+                attributes=["dNSHostName", "name", "operatingSystem", "servicePrincipalName"],
+                paged_size=page_size, generator=True)
+            for e in entries:
+                if e.get("type") != "searchResEntry":
+                    continue
+                a = e["attributes"]
+                dns_name = _first(a.get("dNSHostName"))
+                name = _first(a.get("name"))
+                os_name = _first(a.get("operatingSystem")) or ""
+                http_hosts = _http_spn_hosts(a.get("servicePrincipalName") or [], dnsroot)
+                spn_str = ";".join(f"{h}:{p}" if p else h for h, p in http_hosts)
+                host = dns_name or (f"{name}.{dnsroot}" if (name and dnsroot) else name)
+                if host:
+                    out.add_host(host, source=f"ldap-computer:{dnsroot}",
+                                 os_name=os_name, spns=spn_str)
+                    n_dom += 1
+                for h, p in http_hosts:
+                    out.add_host(h, port=p, source=f"ldap-http-spn:{dnsroot}",
+                                 os_name=os_name)
+            console.print(f"[green][ldap][/green] {dnsroot}: {n_dom} computers")
+            total += n_dom
+            out.dump()
+        except Exception as e:
+            console.print(f"[yellow][ldap][/yellow] {dnsroot}: search error: {e}")
+    console.print(f"[green][ldap][/green] {total} computers total "
+                  f"across {len(search_bases)} domain(s), HTTP SPNs folded in.")
+    if use_gc:
+        console.print("[dim]Note: the Global Catalog holds a partial attribute set; "
+                      "some servicePrincipalName values may be missing. Re-run per "
+                      "domain without --gc for complete SPNs if needed.[/dim]")
 
     if conf_dn:
         sub_base = f"CN=Subnets,CN=Sites,{conf_dn}"
@@ -374,7 +525,7 @@ def run_ldap(args):
         console.print(f"[cyan][ldap][/cyan] domain: {domain}")
     try:
         ldap_recon(out, dc, domain, args.user, args.password,
-                   args.kerberos, args.ssl, args.page_size, args.auth)
+                   args.kerberos, args.ssl, args.page_size, args.auth, args.gc)
     except KeyboardInterrupt:
         console.print("\n[yellow]Ctrl-C -- saving what we have...[/yellow]")
     out.dump()
@@ -468,6 +619,9 @@ def main():
                         help="bind method: auto picks NTLM for DOMAIN\\user, "
                              "simple for user@domain.tld (default auto)")
     p_ldap.add_argument("--ssl", action="store_true", help="LDAPS on 636")
+    p_ldap.add_argument("--gc", action="store_true",
+                        help="query the Global Catalog (port 3268/3269) to enumerate "
+                             "computers across ALL domains in the forest")
     p_ldap.add_argument("--page-size", type=int, default=500)
     p_ldap.set_defaults(func=run_ldap)
 

@@ -204,6 +204,14 @@ If you got `bind failed: NTLM needs domain/username and a password`, it means th
 user reached the NTLM path without a `DOMAIN\` prefix. Either add the domain and
 backslash, or use the UPN form with `--ssl`.
 
+If you got `unsupported hash type MD4`, that is OpenSSL 3 dropping MD4 from its
+default provider, which NTLM needs for the NT hash. The script carries its own
+pure-Python MD4 and switches to it automatically when the system one is missing,
+so this is handled for you with no extra install and no config changes. You will
+see a one-line note that it fell back to the built-in MD4. If you would rather
+avoid NTLM entirely, the UPN plus `--ssl` simple bind or `--kerberos` both skip
+MD4.
+
 If you would rather use the Kerberos ticket you already have on a domain-joined
 box, use `--kerberos` instead of a password, though that needs a working GSSAPI
 or SSPI setup. If you leave off `--dc` and `--domain`, the script tries to work
@@ -211,8 +219,34 @@ them out from the environment and from DNS SRV records, which usually just works
 on a domain-joined machine.
 
 ldap mode options: `--dc`, `--domain`, `--user`, `--password`, `--auth`
-(auto, ntlm, simple), `--kerberos`, `--ssl` (LDAPS on 636), `--page-size`
+(auto, ntlm, simple), `--kerberos`, `--ssl` (LDAPS on 636), `--gc`, `--page-size`
 (default 500).
+
+### One domain or the whole forest
+
+By default this queries the single domain that the DC you connect to belongs to.
+It still reads the AD Sites subnet list, which is forest-wide, so `ad_subnets.txt`
+covers everything regardless. The computer objects, though, come from just that
+one domain.
+
+On connect it enumerates every domain partition in the forest and prints the
+list, so you can see what is out there. If there is more than one and you did not
+ask for all of them, it says so.
+
+To pull computers from every domain in the forest in one run, add `--gc`. That
+connects to the Global Catalog on port 3268 (or 3269 with `--ssl`) and walks each
+domain partition. The inventory records which domain each host came from, in the
+`source` column.
+
+```
+python recon_hosts.py ldap --user 'CONTOSO\jdoe' --password 'secret' --gc -o recon_out
+```
+
+Two caveats. The Global Catalog holds a partial set of attributes, so a few
+`servicePrincipalName` values can be missing from a GC scan. If you need complete
+SPNs for a particular domain, run that domain without `--gc` by pointing `--dc`
+at one of its controllers. And this covers one forest. A separate trusted forest
+needs its own credentials, so run the tool again against a DC there.
 
 ## The subnet mode
 
