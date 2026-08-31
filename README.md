@@ -220,12 +220,23 @@ expired password, `533` is a disabled account. If the message mentions
 `unwillingToPerform` or `strongAuthRequired`, the DC is enforcing LDAP signing or
 channel binding rather than rejecting your password.
 
-For a hardened DC that requires signing, NTLM sealing usually fixes it, and the
-script turns sealing on by default over plain LDAP and also retries with it once
-automatically. If sealing is not enough, use LDAPS with `--ssl`, or authenticate
-with `--kerberos`. A UPN plus `--ssl` gives a TLS simple bind, which satisfies the
-secure-channel requirement a different way. You can turn sealing off with
-`--no-seal` if you ever need to.
+If the bind is rejected with `invalid credentials (AD code 52e)`, the DC
+evaluated the password and it did not match. This is not a transport or signing
+problem, so the script does not retry, because each attempt raises the account's
+bad-password count and can lock it out. When you are sure the password is right,
+the usual causes are, in order: the shell mangled the password (re-run without
+`--password` and type it at the hidden prompt, since characters like `$`, backtick,
+`!`, `%`, `&`, and `"` break in PowerShell or cmd); the NTLM domain was the DNS
+name rather than the short NetBIOS name, so use `CONTOSO\user` not
+`contoso.local\user`; the UPN suffix differs from the DNS domain, so the real
+logon UPN might be `jdoe@contoso.com` even though the directory is
+`corp.contoso.local`; or the login name you use is not the account's
+sAMAccountName. Verify the account is not already locked before trying again.
+
+To keep the password away from the shell entirely, leave `--password` off. The
+script then reads `$LDAP_PASSWORD` if set, otherwise prompts for it without
+echoing. That is the most reliable way to pass a password with special
+characters.
 
 If you would rather use the Kerberos ticket you already have on a domain-joined
 box, use `--kerberos` instead of a password, though that needs a working GSSAPI

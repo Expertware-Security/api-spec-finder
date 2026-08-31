@@ -386,10 +386,16 @@ def ldap_recon(out, dc, domain, user, password, use_kerberos, use_ssl, page_size
         console.print(f"[red][ldap][/red] bind error: {e}")
         return
     if not ok:
-        console.print(f"[red][ldap][/red] bind rejected: {explain_bind(conn)}")
-        # one automatic retry: add NTLM sealing if we did not already
-        if (not use_kerberos and user and password and not use_ssl and ENCRYPT
-                and choose_auth(user, auth)[0] == "ntlm" and not no_seal
+        reason = explain_bind(conn)
+        desc = (conn.result or {}).get("description", "")
+        console.print(f"[red][ldap][/red] bind rejected: {reason}")
+
+        transport_fail = desc in ("unwillingToPerform", "strongAuthRequired")
+        # Only retry with sealing for transport/signing failures. NEVER retry on
+        # invalidCredentials -- another attempt just raises badPwdCount and can
+        # lock the account.
+        if (transport_fail and not use_kerberos and user and password and not use_ssl
+                and ENCRYPT and choose_auth(user, auth)[0] == "ntlm" and not no_seal
                 and conn.session_security != ENCRYPT):
             console.print("[yellow][ldap][/yellow] retrying NTLM with sealing...")
             try:
@@ -405,10 +411,30 @@ def ldap_recon(out, dc, domain, user, password, use_kerberos, use_ssl, page_size
                                   f"{explain_bind(conn2)}")
             except Exception as e:
                 console.print(f"[red][ldap][/red] sealed retry error: {e}")
+
         if not ok:
-            console.print("[dim]If the DC enforces channel binding on LDAPS, or "
-                          "signing on 389, try: --ssl for LDAPS, or --kerberos with "
-                          "a valid ticket. UPN + --ssl does a TLS simple bind.[/dim]")
+            if "52e" in reason or desc == "invalidCredentials":
+                console.print(
+                    "[yellow]This is a genuine credential rejection, not a "
+                    "transport problem. The script will NOT retry, because each "
+                    "attempt raises badPwdCount and can lock the account.[/yellow]")
+                console.print("[dim]Check, in order of likelihood:\n"
+                              "  1. Password mangled by the shell. Re-run without "
+                              "--password and type it at the prompt (special chars "
+                              "like $ ` ! % & \" break in PowerShell/cmd).\n"
+                              "  2. NTLM domain must be the short NetBIOS name: "
+                              "'CONTOSO\\user', not 'contoso.local\\user'.\n"
+                              "  3. For UPN, the suffix may differ from the DNS "
+                              "domain (e.g. jdoe@contoso.com even though AD is "
+                              "corp.contoso.local). Use the real logon UPN.\n"
+                              "  4. The login name may not be the sAMAccountName.\n"
+                              "Verify the account is not already locked before "
+                              "trying again.[/dim]")
+            else:
+                console.print("[dim]If the DC enforces channel binding on LDAPS, or "
+                              "signing on 389, try: --ssl for LDAPS, or --kerberos "
+                              "with a valid ticket. UPN + --ssl does a TLS simple "
+                              "bind.[/dim]")
             return
     console.print("[green][ldap][/green] bind ok.")
 
@@ -600,6 +626,22 @@ def run_ldap(args):
         return
     if domain:
         console.print(f"[cyan][ldap][/cyan] domain: {domain}")
+
+    # Resolve the password without letting the shell mangle special characters:
+    # explicit --password wins, then $LDAP_PASSWORD, then a hidden prompt.
+    if not args.kerberos and args.user and not args.password:
+        env_pw = os.environ.get("LDAP_PASSWORD")
+        if env_pw is not None:
+            args.password = env_pw
+            console.print("[dim][ldap] using password from $LDAP_PASSWORD[/dim]")
+        else:
+            import getpass
+            try:
+                args.password = getpass.getpass(f"Password for {args.user}: ")
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[red][ldap][/red] no password provided.")
+                return
+
     try:
         ldap_recon(out, dc, domain, args.user, args.password,
                    args.kerberos, args.ssl, args.page_size, args.auth, args.gc,
@@ -691,7 +733,9 @@ def main():
     p_ldap.add_argument("--dc", help="domain controller host/IP (auto if omitted)")
     p_ldap.add_argument("--domain", help="AD domain FQDN (auto if omitted)")
     p_ldap.add_argument("--user", help="DOMAIN\\user or user@domain.tld")
-    p_ldap.add_argument("--password", help="password for --user (NTLM bind)")
+    p_ldap.add_argument("--password", help="password for --user. If omitted, taken "
+                        "from $LDAP_PASSWORD or a hidden prompt (avoids shell "
+                        "mangling of special characters)")
     p_ldap.add_argument("--kerberos", action="store_true", help="use current ticket")
     p_ldap.add_argument("--auth", choices=["auto", "ntlm", "simple"], default="auto",
                         help="bind method: auto picks NTLM for DOMAIN\\user, "
