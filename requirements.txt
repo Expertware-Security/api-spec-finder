@@ -5,6 +5,11 @@ openpyxl>=3.1
 # --current-user: test endpoints as the current logged-in Windows user (SSPI)
 requests-negotiate-sspi>=0.3 ; sys_platform == "win32"
 
+# fast_http_scan.py (masscan-style all-ports HTTP discovery)
+# core sweep + HTTP id uses only the standard library; openpyxl (above) for the
+# Excel export; cryptography only for `--selftest` (throwaway self-signed cert).
+cryptography>=42.0
+
 # recon_hosts.py (discovery)
 ldap3>=2.9
 psutil>=5.9

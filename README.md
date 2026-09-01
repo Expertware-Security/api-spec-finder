@@ -227,6 +227,88 @@ Keep the authorization paperwork handy for whatever ranges you put in the hosts
 file. The default User-Agent is set to flag the traffic as an authorized
 assessment so it is easy to spot in their logs.
 
+# Finding HTTP ports fast with fast_http_scan.py
+
+`api_auth_recon.py --all-ports` is fine for a handful of hosts, but when you have
+hundreds or thousands of hosts and need *every* HTTP port across all 65535, use
+`fast_http_scan.py`. It is a standalone, masscan-style discovery tool written in
+pure Python (no masscan or nmap binary required) that answers one question quickly:
+**which ports of each host actually speak HTTP or HTTPS?**
+
+It works in two phases:
+
+1. A fast, high-concurrency **TCP connect sweep** across every requested port on
+   every host. Open sockets are RST-closed (`SO_LINGER 0`) so they never pile up in
+   `TIME_WAIT`, which is what normally exhausts a Windows box during a big scan.
+2. An **HTTP/HTTPS identification** pass over only the ports that came back open. It
+   sends one real request, checks for an `HTTP/` reply, and records scheme, status,
+   `Server`, content type, redirect target and page title. Non-web open ports (SSH,
+   RDP, SMB, ...) are dropped, so the final list is HTTP only.
+
+```
+# all ports on every host in targets.txt, aim to finish in about 3 hours
+python fast_http_scan.py -t targets.txt --budget-hours 3
+
+# or pick the process count yourself
+python fast_http_scan.py -t targets.txt -p 1-65535 -P 12
+```
+
+The targets file takes one entry per line: an IP, a CIDR (`10.0.0.0/24`), an IP
+range (`10.0.0.1-10.0.0.50` or `10.0.0.1-50`), or a hostname. Comments with `#` and
+blank lines are ignored, and pasted URLs are tolerated (scheme and path are stripped).
+
+## Output
+
+Everything is written under the `-o` base name (default `scan_<timestamp>`):
+
+- `<base>.byhost.txt` — the human view you asked for: only the HTTP ports of each
+  host, e.g. `10.0.0.5   80/http  443/https  8080/http`.
+- `<base>.urls.txt` — one `scheme://host:port` per line, ready to pipe straight
+  into `api_auth_recon.py --targets <base>.urls.txt --current-user`.
+- `<base>.xlsx` — an Excel workbook with a **"HTTP by host"** sheet (one row per
+  host, its HTTP port list and URLs) and an **"Endpoints"** sheet (one row per
+  endpoint with status/server/title; HTTPS rows tinted green).
+- `<base>.open.txt` — every open `ip:port` from phase 1, HTTP or not.
+- `<base>.http.jsonl` / `.http.csv` — full per-endpoint detail.
+- `<base>.journal*.jsonl` — a crash-safe journal; rerun with `--resume` to pick up
+  where an interrupted scan left off.
+
+## Speed, and why it uses processes
+
+A single Python async event loop is CPU-bound long before the network is — on a
+typical box it tops out around 1,000-1,500 connect attempts per second no matter
+how high you push `--concurrency`. So the real speed lever is **processes**: the
+sweep shards the port range across `-P/--processes` worker processes, each with its
+own event loop and core. Aggregate throughput scales roughly with the process count
+up to the number of cores (and the point where your NIC or the target firewalls
+become the limit).
+
+- `--budget-hours N` picks a process count for you to hit a rough time target.
+- `-P/--processes N` sets it directly; the default is `min(8, cores)`.
+- `-c/--concurrency` is per process (default 2000); total in-flight sockets are
+  `processes x concurrency`, kept inside the machine's ephemeral-port range.
+- `--connect-timeout` (default 1.5s) is the single biggest speed knob on a
+  firewalled network — on a fast internal LAN you can safely drop it to `1.0` or
+  lower, since only filtered ports ever wait the full timeout.
+
+Run `python fast_http_scan.py --rate-tune` to see your core count, ephemeral-port
+range, and concrete time estimates for the 1200-host / all-ports case. Because the
+achievable rate depends on your network and the targets' firewalls, the honest way
+to size a big job is to scan a small sample first (say 20 hosts), watch the live
+`N/s` rate the tool prints, and extrapolate. On Windows the machine-wide firewall
+(WFP) filters every outbound connection, so if the rate plateaus below what the
+core count suggests, that is usually the ceiling — raising `--processes` further
+will not help past it.
+
+## Verifying it works
+
+`python fast_http_scan.py --selftest` spins up a local HTTP server, a local HTTPS
+server (throwaway self-signed cert), and a silent non-HTTP TCP port, then runs the
+full pipeline against them and asserts that each is classified correctly. It needs
+`cryptography` (already in `requirements.txt`) only for that self-signed cert; the
+scan itself uses nothing beyond the standard library plus `openpyxl` for the Excel
+export.
+
 # Building the host list with recon_hosts.py
 
 This is the discovery stage, and it has three modes so two people can divide the
